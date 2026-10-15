@@ -1,0 +1,349 @@
+# The driver the tests run against, registered as "dummy": crystal-db's
+# `spec/dummy_driver.cr` and the helpers of `spec/spec_helper.cr`.
+#
+# A query's text is its result: rows separated by spaces, columns by
+# commas. `"3,4 1,2"` answers two rows of two columns, `NULL` is a nil, `?`
+# is the first bound argument, and a column that reads as an integer is an
+# `Int64`. A few queries misbehave on purpose: `"syntax error"` cannot be
+# prepared, `"raise ConnectionLost"` loses the connection, and an exec of
+# `"raise"` fails.
+module iyi_db/testing/dummy_driver
+
+import std/uri::{URI, Params}
+import std/text
+import std/slice::{Slice, Bytes}
+import iyi_db/db
+import iyi_db/errors::*
+import iyi_db/value::*
+import iyi_db/core::*
+
+pub class DummyDriver < Driver
+  def connection_builder(uri : URI) : ConnectionBuilder | DBError
+    params = Params.parse(uri.query || "")
+    DummyConnectionBuilder.new(connection_options(params)!)
+  end
+end
+
+pub class DummyConnectionBuilder < ConnectionBuilder
+  def initialize(@options : Connection::Options)
+  end
+
+  def build : Connection | DBError
+    DummyConnection.new(@options)
+  end
+end
+
+pub class DummyConnection < Connection
+  @@connections = [] of DummyConnection
+  @@connections_count = 0
+
+  @connected = true
+
+  def initialize(options : Connection::Options)
+    super(options)
+    sleep 0
+    @@connections_count += 1
+    @@connections << self
+  end
+
+  def self.connections_count : Int32
+    @@connections_count
+  end
+
+  def self.connections : Array(DummyConnection)
+    @@connections
+  end
+
+  def self.clear_connections : Nil
+    @@connections = [] of DummyConnection
+  end
+
+  def build_prepared_statement(query : String) : Statement | DBError
+    assert_not_closed
+    build_statement(query, true)
+  end
+
+  def build_unprepared_statement(query : String) : Statement | DBError
+    assert_not_closed
+    build_statement(query, false)
+  end
+
+  # crystal-db's statement raised these from its constructor; a
+  # constructor answers no error here, so the connection does.
+  private def build_statement(query : String, prepared : Bool) : Statement | DBError
+    statement = DummyStatement.new(self, query, prepared)
+    return DBError.new(query) if query == "syntax error"
+    return ConnectionLost.new(self) if query == "raise ConnectionLost"
+    statement
+  end
+
+  def driver_name : String
+    "dummy"
+  end
+
+  def last_insert_id : Int64
+    assert_not_closed
+    0_i64
+  end
+
+  def check : Nil | DBError
+    return ConnectionLost.new(self) unless @connected
+    nil
+  end
+
+  def disconnect : Nil
+    @connected = false
+  end
+
+  protected def create_transaction : Transaction
+    assert_not_closed
+    DummyTransaction.new(self)
+  end
+
+  private def assert_not_closed : Nil
+    raise "Statement is closed" if closed?
+  end
+end
+
+pub class DummyTransaction < TopLevelTransaction
+  getter committed = false
+  getter rolledback = false
+
+  def initialize(connection : Connection)
+    super(connection)
+  end
+
+  # The flags say the commit or rollback went through: crystal set them
+  # after a `super` that raised on failure.
+  def commit : Nil | DBError
+    result = super
+    @committed = true if result.nil?
+    result
+  end
+
+  def rollback : Nil | DBError
+    result = super
+    @rolledback = true if result.nil?
+    result
+  end
+
+  protected def create_save_point_transaction(parent : Transaction, savepoint_name : String) : SavePointTransaction
+    DummySavePointTransaction.new(parent, savepoint_name)
+  end
+end
+
+pub class DummySavePointTransaction < SavePointTransaction
+  getter committed = false
+  getter rolledback = false
+
+  def initialize(parent : Transaction, savepoint_name : String)
+    super(parent, savepoint_name)
+  end
+
+  def commit : Nil | DBError
+    result = super
+    @committed = true if result.nil?
+    result
+  end
+
+  def rollback : Nil | DBError
+    result = super
+    @rolledback = true if result.nil?
+    result
+  end
+end
+
+pub class DummyStatement < Statement
+  @@statements_count = 0
+  @@statements_exec_count = 0
+
+  getter params : Hash(Int32, DBValue)
+
+  def initialize(connection : Connection, command : String, @prepared : Bool)
+    @params = {} of Int32 => DBValue
+    super(connection, command)
+    @@statements_count += 1
+  end
+
+  def self.statements_count : Int32
+    @@statements_count
+  end
+
+  def self.statements_exec_count : Int32
+    @@statements_exec_count
+  end
+
+  protected def perform_query(args : Array(DBValue)) : ResultSet | DBError
+    assert_not_closed
+    @@statements_exec_count += 1
+    sleep 0
+    @connection.as(DummyConnection).check!
+    set_params args
+    DummyResultSet.new self, command
+  end
+
+  protected def perform_exec(args : Array(DBValue)) : ExecResult | DBError
+    assert_not_closed
+    @@statements_exec_count += 1
+    @connection.as(DummyConnection).check!
+    set_params args
+    return DBError.new("forced exception due to query") if command == "raise"
+    ExecResult.new 0_i64, 0_i64
+  end
+
+  private def set_params(args : Array(DBValue)) : Nil
+    @params = {} of Int32 => DBValue
+    args.each_with_index do |arg, index|
+      @params[index] = arg
+    end
+  end
+
+  def prepared? : Bool
+    @prepared
+  end
+
+  private def assert_not_closed : Nil
+    raise "Statement is closed" if closed?
+  end
+end
+
+pub class DummyResultSet < ResultSet
+  @@last_result_set : DummyResultSet? = nil
+
+  @top_values : Array(Array(String))
+  @values : Array(String)?
+  @column_count : Int32
+
+  def initialize(statement : Statement, command : String)
+    super(statement)
+    sleep 0
+    @top_values = command.split.map { |row| row.split(',') }
+    @column_count = @top_values.size > 0 ? @top_values[0].size : 2
+    @values = nil
+    @@last_result_set = self
+  end
+
+  def self.last_result_set : DummyResultSet
+    @@last_result_set || raise "no result set yet"
+  end
+
+  def move_next : Bool | DBError
+    @values = @top_values.shift?
+    !@values.nil?
+  end
+
+  def column_count : Int32
+    @column_count
+  end
+
+  def column_name(index : Int32) : String
+    "c#{index}"
+  end
+
+  def read : DBValue | DBError
+    values = @values || raise "no row"
+    n = values.shift?
+    raise "end of row" if n.nil?
+    return nil if n == "NULL"
+    if n == "?"
+      return @statement.as(DummyStatement).params[0]
+    end
+    n.to_i64? || n
+  end
+
+  def next_column_index : Int32
+    values = @values || raise "no row"
+    @column_count - values.size
+  end
+
+  def read(t : String.class) : String | DBError
+    read!.to_s
+  end
+
+  # `(String | Nil).class`, not `String?.class`: iyi 0.17.0 writes the short
+  # spelling into an artifact as `String | ::Nil.class`, which matches
+  # nothing.
+  def read(t : (String | Nil).class) : String? | DBError
+    value = read!
+    value.nil? ? nil : value.to_s
+  end
+
+  def read(t : Int32.class) : Int32 | DBError
+    text = read(String)!
+    text.to_i? || ArgumentError.new("Invalid Int32: #{text.inspect}")
+  end
+
+  def read(t : (Int32 | Nil).class) : Int32? | DBError
+    text = read(String?)!
+    return nil if text.nil?
+    text.to_i? || ArgumentError.new("Invalid Int32: #{text.inspect}")
+  end
+
+  def read(t : Int64.class) : Int64 | DBError
+    text = read(String)!
+    text.to_i64? || ArgumentError.new("Invalid Int64: #{text.inspect}")
+  end
+
+  def read(t : (Int64 | Nil).class) : Int64? | DBError
+    text = read(String?)!
+    return nil if text.nil?
+    text.to_i64? || ArgumentError.new("Invalid Int64: #{text.inspect}")
+  end
+
+  def read(t : Float32.class) : Float32 | DBError
+    text = read(String)!
+    parsed = text.to_f?
+    return ArgumentError.new("Invalid Float32: #{text.inspect}") if parsed.nil?
+    parsed.to_f32
+  end
+
+  def read(t : Float64.class) : Float64 | DBError
+    text = read(String)!
+    text.to_f? || ArgumentError.new("Invalid Float64: #{text.inspect}")
+  end
+
+  def read(t : Bytes.class) : Bytes | DBError
+    value = read!
+    case value
+    when String
+      bytes = value.bytes
+      Bytes.new(bytes.size) { |index| bytes[index] }
+    when Bytes
+      value
+    else
+      raise "#{value} is not convertible to Bytes"
+    end
+  end
+end
+
+IyiDb::Db.register_driver "dummy", DummyDriver
+
+# Counts down the checks an example expects, so a block that should have
+# run and did not fails the example.
+pub class Witness
+  getter count : Int32
+
+  def initialize(@count : Int32 = 1)
+  end
+
+  def check : Nil
+    @count -= 1
+  end
+end
+
+pub def with_witness(count : Int32 = 1, & : Witness -> Nil) : Nil
+  w = Witness.new(count)
+  yield w
+  assert w.count == 0, "The expected coverage was unmet"
+end
+
+pub def with_dummy(uri : String = "dummy://host?checkout_timeout=0.5", & : Database -> Nil) : Nil
+  DummyConnection.clear_connections
+  IyiDb::Db.open(uri) { |db| yield db }.or_panic
+end
+
+pub def with_dummy_connection(options : String = "", & : DummyConnection -> Nil) : Nil
+  with_dummy("dummy://host?checkout_timeout=0.5&#{options}") do |db|
+    db.using_connection { |cnn| yield cnn.as(DummyConnection) }.or_panic
+  end
+end
