@@ -1,0 +1,327 @@
+# Reading the rows of a result set into structs and classes: crystal-db's
+# `DB::Serializable` and its deprecated `DB.mapping`.
+#
+# `include DB::Serializable` becomes a derive, the way iyi adds methods to a
+# type (SPEC.md II.4):
+#
+# ```
+# import db/iyi_db/serializable::{db_serializable, DBField}
+#
+# class Employee
+#   property title : String
+#
+#   @[DBField(key: "firstname")]
+#   property name : String?
+#
+#   derive db_serializable
+# end
+#
+# employees = Employee.from_rs(db.query("SELECT title, firstname FROM employees")!)!
+# employees[0].title # => "Manager"
+# employees[0].name  # => "John"
+# ```
+#
+# The derive gives the type two class methods:
+#
+# * `from_db_row(rs) : self | DBError` reads the current row (crystal-db's
+#   `Type.new(rs)`), and is what `rs.read(Type)`, `query_one(as: Type)` and
+#   `query_all(as: Type)` call;
+# * `from_rs(rs) : Array(self) | DBError` reads every row and closes the
+#   result set.
+#
+# Every instance variable is read from the column of its name. A failure is
+# a `MappingError` naming the type and the property: a column whose value the
+# property's type cannot hold, a column no property reads (unless the type
+# derives `db_serializable_non_strict`), and a property no column fills -
+# unless the property is nilable, which leaves it `nil`, or has a default,
+# which it keeps (a `NULL` keeps the default too, for a property that cannot
+# hold nil).
+#
+# `DBField` properties:
+# * **ignore**: if `true`, the property is not read
+# * **key**: the column to read (the instance variable's name by default)
+# * **converter**: a type whose `from_rs(rs : ResultSet)` reads the value,
+#   answering it or a `DBError`
+module iyi_db/serializable
+
+pub import iyi_db/errors
+pub import iyi_db/core
+
+# Sets how one instance variable is read. See the module's documentation.
+pub annotation DBField
+end
+
+# Reads the type from result sets, and refuses a column it has no property
+# for. Crystal's `include DB::Serializable`.
+pub macro db_serializable(declaration)
+  ::IyiDb::Serializable.db_serializable_with({{ declaration }}, true)
+end
+
+# Reads the type from result sets, passing over a column it has no property
+# for. Crystal's `include DB::Serializable` with
+# `include DB::Serializable::NonStrict`.
+pub macro db_serializable_non_strict(declaration)
+  ::IyiDb::Serializable.db_serializable_with({{ declaration }}, false)
+end
+
+# What both derives write: *strict* says whether an unknown column is an
+# error.
+pub macro db_serializable_with(declaration, strict)
+  # Reads the current row of *rs*; a `MappingError` when it does not fit.
+  #
+  # The columns are read in an instance method, where `typeof(@field)`
+  # names each field's type from inside the type (a type written out by the
+  # macro would be reached the way another module reaches it, R-2), and the
+  # instance is then built from the values by an `initialize` that assigns
+  # every field, as the compiler requires.
+  def self.from_db_row(rs : ::IyiDb::Core::ResultSet) : self | ::IyiDb::Errors::DBError
+    values = allocate.__iyi_db_read_values(rs)
+    return values if values.is_a?(::IyiDb::Errors::DBError)
+    new(__iyi_db_values: values)
+  end
+
+  # Reads every row of *rs*, and closes it.
+  def self.from_rs(rs : ::IyiDb::Core::ResultSet) : Array(self) | ::IyiDb::Errors::DBError
+    defer rs.close
+    objects = [] of self
+    # A macro body cannot hold `end!`: its scanner counts `end` to find
+    # where the macro stops.
+    iterated = rs.each do
+      object = from_db_row(rs)
+      return object if object.is_a?(::IyiDb::Errors::DBError)
+      objects << object
+    end
+    return iterated if iterated.is_a?(::IyiDb::Errors::DBError)
+    objects
+  end
+
+  def initialize(*, __iyi_db_values values : V) forall V
+    \{% for ivar in @type.instance_vars %}
+      \{% ann = ivar.annotation(::IyiDb::Serializable::DBField) %}
+      \{% unless ann && ann[:ignore] %}
+        @\{{ ivar.id }} = values[:\{{ ivar.id }}]
+      \{% end %}
+    \{% end %}
+  end
+
+  protected def __iyi_db_read_values(rs : ::IyiDb::Core::ResultSet)
+    \{% begin %}
+      \{% properties = {} of Nil => Nil %}
+      \{% for ivar in @type.instance_vars %}
+        \{% ann = ivar.annotation(::IyiDb::Serializable::DBField) %}
+        \{% unless ann && ann[:ignore] %}
+          \{% properties[ivar.id] = {key: ((ann && ann[:key]) || ivar).id.stringify, default: ivar.default_value, has_default: ivar.has_default_value?, nilable: ivar.type.nilable?, converter: ann && ann[:converter]} %}
+        \{% end %}
+      \{% end %}
+
+      \{% for name, value in properties %}
+        __iyi_db_value_\{{ name }} = nil
+        __iyi_db_found_\{{ name }} = false
+      \{% end %}
+
+      \{% unless properties.empty? %}
+      rs.each_column do |col_name|
+        case col_name
+        \{% for name, value in properties %}
+        when \{{ value[:key] }}
+          __iyi_db_found_\{{ name }} = true
+          \{% if value[:converter] %}
+            __iyi_db_read_\{{ name }} = \{{ value[:converter] }}.from_rs(rs)
+          \{% elsif value[:nilable] || value[:has_default] %}
+            __iyi_db_read_\{{ name }} = rs.read(typeof(@\{{ name }}, nil))
+          \{% else %}
+            __iyi_db_read_\{{ name }} = rs.read(typeof(@\{{ name }}))
+          \{% end %}
+          if __iyi_db_read_\{{ name }}.is_a?(::IyiDb::Errors::DBError)
+            return ::IyiDb::Errors::MappingError.new(__iyi_db_read_\{{ name }}.message, self.class.to_s, \{{ name.stringify }}, cause: __iyi_db_read_\{{ name }})
+          end
+          __iyi_db_value_\{{ name }} = __iyi_db_read_\{{ name }}
+        \{% end %}
+        else
+          skipped = rs.read
+          return skipped if skipped.is_a?(::IyiDb::Errors::DBError)
+          {% if strict %}
+            return ::IyiDb::Errors::MappingError.new("Unknown column: #{col_name}", self.class.to_s)
+          {% end %}
+        end
+      end
+      \{% else %}
+      rs.each_column do |col_name|
+        skipped = rs.read
+        return skipped if skipped.is_a?(::IyiDb::Errors::DBError)
+        {% if strict %}
+          return ::IyiDb::Errors::MappingError.new("Unknown column: #{col_name}", self.class.to_s)
+        {% end %}
+      end
+      \{% end %}
+
+      \{% for name, value in properties %}
+        \{% unless value[:nilable] || value[:has_default] %}
+          if __iyi_db_value_\{{ name }}.nil? && !__iyi_db_found_\{{ name }}
+            return ::IyiDb::Errors::MappingError.new("Missing column " + \{{ value[:key] }}, self.class.to_s, \{{ name.stringify }})
+          end
+        \{% end %}
+      \{% end %}
+
+      \{% for name, value in properties %}
+        \{% if value[:nilable] %}
+          \{% if value[:has_default] %}
+            __iyi_db_final_\{{ name }} = __iyi_db_found_\{{ name }} ? __iyi_db_value_\{{ name }} : \{{ value[:default] }}
+          \{% else %}
+            __iyi_db_final_\{{ name }} = __iyi_db_value_\{{ name }}
+          \{% end %}
+        \{% elsif value[:has_default] %}
+          __iyi_db_set_\{{ name }} = __iyi_db_value_\{{ name }}
+          __iyi_db_final_\{{ name }} = __iyi_db_set_\{{ name }}.nil? ? \{{ value[:default] }} : __iyi_db_set_\{{ name }}
+        \{% else %}
+          __iyi_db_final_\{{ name }} = __iyi_db_value_\{{ name }}.as(typeof(@\{{ name }}))
+        \{% end %}
+      \{% end %}
+
+      \{% if properties.empty? %}
+        nil
+      \{% else %}
+        { \{% for name, value in properties %} \{{ name }}: __iyi_db_final_\{{ name }}, \{% end %} }
+      \{% end %}
+    \{% end %}
+  end
+end
+
+# Declares the properties of a type and reads them from result sets:
+# crystal-db's deprecated `DB.mapping`, for code written against it.
+# `derive db_serializable` is what new code writes.
+#
+# ```
+# class Employee
+#   mapping({
+#     title: String,
+#     name:  {
+#       type:    String,
+#       nilable: true,
+#       key:     "firstname",
+#     },
+#   })
+# end
+# ```
+#
+# Each property is a type, or a named tuple of:
+#
+# * *type* (required) defines its type. `title: String` is a shortcut to
+#   `title: {type: String}`.
+# * *nilable* defines if a property can be a `Nil`.
+# * *default*: the value to use if the property is missing in the result
+#   set, or if it's `null` and `nilable` was not set to `true`.
+# * *key* defines which column to read from a `ResultSet`. It defaults to the
+#   name of the property.
+# * *converter* takes an alternate type for parsing. It requires a `from_rs`
+#   class method in that type, answering the property's value or a
+#   `DBError`.
+#
+# The mapping defines the instance variables, a getter and a setter for each
+# property, `from_db_row(rs)` and `from_rs(rs)`, as `db_serializable` does. A
+# missing or unknown column is a `MappingError` (`strict: false` passes over
+# an unknown one); a value that cannot be read is the error reading it
+# answered.
+pub macro mapping(properties, strict = true)
+  {% for key, value in properties %}
+    {% properties[key] = {type: value} unless value.is_a?(HashLiteral) || value.is_a?(NamedTupleLiteral) %}
+  {% end %}
+
+  {% for key, value in properties %}
+    {% value[:nilable] = true if value[:type].is_a?(Generic) && value[:type].type_vars.map(&.resolve).includes?(Nil) %}
+
+    {% if value[:type].is_a?(Call) && value[:type].name == "|" &&
+            (value[:type].receiver.resolve == Nil || value[:type].args.map(&.resolve).any?(&.==(Nil))) %}
+      {% value[:nilable] = true %}
+    {% end %}
+  {% end %}
+
+  {% for key, value in properties %}
+    @{{ key.id }} : {{ value[:type] }} {{ (value[:nilable] ? "?" : "").id }}
+
+    def {{ key.id }}=(_{{ key.id }} : {{ value[:type] }} {{ (value[:nilable] ? "?" : "").id }})
+      @{{ key.id }} = _{{ key.id }}
+    end
+
+    def {{ key.id }} : {{ value[:type] }} {{ (value[:nilable] ? "?" : "").id }}
+      @{{ key.id }}
+    end
+  {% end %}
+
+  # Reads every row of *rs*, and closes it.
+  def self.from_rs(%rs : ::IyiDb::Core::ResultSet) : Array(self) | ::IyiDb::Errors::DBError
+    defer %rs.close
+    %objs = [] of self
+    %iterated = %rs.each do
+      %obj = from_db_row(%rs)
+      return %obj if %obj.is_a?(::IyiDb::Errors::DBError)
+      %objs << %obj
+    end
+    return %iterated if %iterated.is_a?(::IyiDb::Errors::DBError)
+    %objs
+  end
+
+  def initialize(*, __iyi_db_mapping_values %values : V) forall V
+    {% for key, value in properties %}
+      @{{ key.id }} = %values[:{{ key.id }}]
+    {% end %}
+  end
+
+  # Reads the current row of *rs*.
+  def self.from_db_row(%rs : ::IyiDb::Core::ResultSet) : self | ::IyiDb::Errors::DBError
+    {% for key, value in properties %}
+      %var{key.id} = nil
+      %found{key.id} = false
+    {% end %}
+
+    %rs.each_column do |col_name|
+      case col_name
+        {% for key, value in properties %}
+          when {{ value[:key] || key.id.stringify }}
+            %found{key.id} = true
+            %read{key.id} =
+              {% if value[:converter] %}
+                {{ value[:converter] }}.from_rs(%rs)
+              {% elsif value[:nilable] || value[:default] != nil %}
+                %rs.read(::Union({{ value[:type] }} | Nil))
+              {% else %}
+                %rs.read({{ value[:type] }})
+              {% end %}
+            return %read{key.id} if %read{key.id}.is_a?(::IyiDb::Errors::DBError)
+            %var{key.id} = %read{key.id}
+        {% end %}
+      else
+        %skipped = %rs.read
+        return %skipped if %skipped.is_a?(::IyiDb::Errors::DBError)
+        {% if strict %}
+          return ::IyiDb::Errors::MappingError.new("unknown result set attribute: #{col_name}", self.to_s)
+        {% end %}
+      end
+    end
+
+    {% for key, value in properties %}
+      {% unless value[:nilable] || value[:default] != nil %}
+        if %var{key.id}.is_a?(Nil) && !%found{key.id}
+          return ::IyiDb::Errors::MappingError.new("missing result set attribute: {{ (value[:key] || key).id }}", self.to_s)
+        end
+      {% end %}
+    {% end %}
+
+    {% for key, value in properties %}
+      {% if value[:nilable] %}
+        {% if value[:default] != nil %}
+          %final{key.id} = %found{key.id} ? %var{key.id} : {{ value[:default] }}
+        {% else %}
+          %final{key.id} = %var{key.id}
+        {% end %}
+      {% elsif value[:default] != nil %}
+        %set{key.id} = %var{key.id}
+        %final{key.id} = %set{key.id}.is_a?(Nil) ? {{ value[:default] }} : %set{key.id}
+      {% else %}
+        %final{key.id} = %var{key.id}.as({{ value[:type] }})
+      {% end %}
+    {% end %}
+
+    new(__iyi_db_mapping_values: { {% for key, value in properties %} {{ key.id }}: %final{key.id}, {% end %} })
+  end
+end
