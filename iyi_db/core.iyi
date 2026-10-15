@@ -1,0 +1,1366 @@
+# Drivers, databases, connections, statements, result sets and
+# transactions: the types a driver subclasses and a program queries through.
+#
+# They refer to one another (a statement belongs to a connection, a result
+# set to a statement, a connection begins transactions and goes back to its
+# database), and an import graph has no cycles (R-1), so they live in one
+# module, as they live in one namespace in crystal-db.
+#
+# What changed from crystal-db, all of it for the same reason (SPEC.md III.1):
+#
+# * Every call that can fail answers `T | DBError` instead of raising. That
+#   includes the methods a driver implements: `move_next`, `read`,
+#   `perform_query`, `perform_exec`, `build_prepared_statement`, ...
+# * `close` answers `Nil | DBError`: a `do_close` that fails leaves the object
+#   open, as a raising `do_close` did.
+# * Constructors do no IO. A transaction is built by `create_transaction` and
+#   started by `start`, which is where `BEGIN` or `SAVEPOINT` runs; a
+#   `Database` is built by `Database.new` and its first connections opened by
+#   `Database.open`.
+# * A `transaction` block that is left early - `return`, `break`, `!`
+#   propagating an error, a panic - rolls back. Crystal committed on `return`
+#   and rolled back on `raise`; iyi's `!` is a `return`, so the two cannot be
+#   told apart, and rolling back is the side that cannot lose data. Call
+#   `tx.commit` before a `return` that should commit.
+# * Statement instrumentation is `Statement.def_around_query_or_exec { ... }`,
+#   a hook registry, because there is no reopening `DB::Statement` here (R-3).
+module iyi_db/core
+
+import std/uri::{URI, Params}
+import std/log::{Log, Logger}
+import std/random::{Random}
+import std/text
+import iyi_db/errors::*
+import iyi_db/value::*
+import iyi_db/query_params::*
+import iyi_db/pooling::*
+
+# The logger every statement writes "Executing query" to, at debug level.
+# crystal-db's `DB::Log`; its source is "db".
+pub LOG = Log.for("db")
+
+# A resource with a `close` that runs once: connections, statements, result
+# sets and transactions. An implementer declares `@closed = false` and a
+# `do_close`.
+pub trait Disposable
+  # Closes this object. A `do_close` that answers an error leaves it open.
+  def close : Nil | DBError
+    return nil if @closed
+    do_close!
+    @closed = true
+    nil
+  end
+
+  # Returns `true` if this object is closed. See `#close`.
+  def closed? : Bool
+    # compared, not answered: read through an artifact, an implementer's
+    # `@closed` can come back typed `Bool | Nil` (iyi 0.17.0)
+    @closed == true
+  end
+end
+
+# Where a connection goes back to: the `Database` whose pool it belongs to,
+# or nowhere for a connection made with `IyiDb::Db.connect`.
+pub trait ConnectionContext
+  # The *connection* was closed for good and must not be used again.
+  abstract def discard(connection : Connection) : Nil
+
+  # The *connection* is no longer needed and can be reused.
+  abstract def release(connection : Connection) : Nil
+end
+
+# The context of a connection that belongs to no pool.
+pub class SingleConnectionContext
+  @@default = SingleConnectionContext.new
+
+  def self.default : SingleConnectionContext
+    @@default
+  end
+
+  def initialize
+  end
+end
+
+impl ConnectionContext for SingleConnectionContext
+  def discard(connection : Connection) : Nil
+  end
+
+  def release(connection : Connection) : Nil
+  end
+end
+
+# A cache of statements by query text.
+pub class StringKeyCache(T)
+  @cache : Hash(String, T)
+
+  def initialize
+    @cache = {} of String => T
+  end
+
+  # The value under *key*, or the block's, stored when it is not an error.
+  def fetch(key : String, & : -> T | DBError) : T | DBError
+    if cached = @cache[key]?
+      return cached
+    end
+    value = yield
+    return value if value.is_a?(DBError)
+    @cache[key] = value
+    value
+  end
+
+  def each_value(& : T -> Nil) : Nil
+    @cache.each { |_, value| yield value }
+  end
+
+  def clear : Nil
+    @cache = {} of String => T
+  end
+end
+
+# Methods to query a database. Every method takes a *query* and its
+# arguments, positionally or as `args:`, or both, positional first:
+#
+# ```
+# db.query("SELECT name FROM ... WHERE age > ?", age)
+# db.query("SELECT name FROM ... WHERE age > ?", args: [age])
+# ```
+#
+# How arguments are written into the query depends on the driver.
+#
+# 1. `#exec` expects no rows and answers an `ExecResult`.
+# 2. `#scalar` answers the first column of the first row.
+# 3. `#query` answers a `ResultSet` over the rows.
+#
+# `as:` reads a row as a type, and a tuple or named tuple type reads several
+# columns: `as: Tuple(String, Int32)`, `as: NamedTuple(name: String, age:
+# Int32)` (crystal-db wrote `as: {String, Int32}`, a tuple of classes whose
+# instance type no signature can name, R-2).
+#
+# An implementer has a `build(query : String)` answering a statement or a
+# `DBError`.
+pub trait QueryMethods
+  # Executes a *query* and returns a `ResultSet` with the results.
+  # The `ResultSet` must be closed manually.
+  #
+  # ```
+  # result = db.query("select name from contacts where id = ?", 10)!
+  # defer result.close
+  # if result.move_next!
+  #   id = result.read(Int32)!
+  # end
+  # ```
+  def query(query : String, *args_ : *T, args : Array(A)? = nil) : ResultSet | DBError forall T, A
+    # bound first: `x!.call` does not survive the round trip through an
+    # artifact's shipped body
+    stmt = build(query)!
+    stmt.query(*args_, args: args)
+  end
+
+  # Executes a *query* and yields a `ResultSet` with the results.
+  # The `ResultSet` is closed when the block is left.
+  #
+  # ```
+  # db.query("select name from contacts where age > ?", 18) do |rs|
+  #   rs.each do
+  #     name = rs.read(String)!
+  #   end!
+  # end!
+  # ```
+  def query(query : String, *args_ : *T, args : Array(A)? = nil, & : ResultSet -> U) : U | DBError forall T, A, U
+    rs = query(query, *args_, args: args)!
+    defer rs.close
+    yield rs
+  end
+
+  # Executes a *query* that expects a single row and yields a `ResultSet`
+  # positioned at that first row.
+  #
+  # The given block must not invoke `move_next` on the yielded result set.
+  #
+  # Answers `NoResultsError` if there were no rows and `DBError` if there were
+  # more than one.
+  #
+  # ```
+  # name = db.query_one("select name from contacts where id = ?", 18) { |rs| rs.read(String) }!
+  # ```
+  def query_one(query : String, *args_ : *T, args : Array(A)? = nil, & : ResultSet -> U) : U | DBError forall T, A, U
+    rs = query(query, *args_, args: args)!
+    defer rs.close
+    return NoResultsError.new("no results") unless rs.move_next!
+    value = yield rs
+    return DBError.new("more than one row") if rs.move_next!
+    value
+  end
+
+  # Executes a *query* that expects a single row and returns it read as
+  # *klass*: a column's type, a `Tuple(...)` or `NamedTuple(...)` of them
+  # for several columns, or a type that derives `db_serializable`.
+  #
+  # ```
+  # db.query_one("select name from contacts where id = ?", 1, as: String)
+  # db.query_one("select name, age from contacts where id = ?", 1, as: Tuple(String, Int32))
+  # db.query_one("select name, age from contacts where id = ?", 1, as: NamedTuple(name: String, age: Int32))
+  # ```
+  def query_one(query : String, *args_ : *T, args : Array(A)? = nil, as klass : K.class) : K | DBError forall T, A, K
+    query_one(query, *args_, args: args) { |rs| rs.read(klass)! }
+  end
+
+  # Executes a *query* that expects at most a single row and yields a
+  # `ResultSet` positioned at that first row.
+  #
+  # Returns `nil`, not invoking the block, if there were no rows, and
+  # `DBError` if there were more than one (after invoking the block once).
+  #
+  # ```
+  # name = db.query_one?("select name from contacts where id = ?", 18) { |rs| rs.read(String) }
+  # ```
+  def query_one?(query : String, *args_ : *T, args : Array(A)? = nil, & : ResultSet -> U) : U | Nil | DBError forall T, A, U
+    rs = query(query, *args_, args: args)!
+    defer rs.close
+    return nil unless rs.move_next!
+    value = yield rs
+    return DBError.new("more than one row") if rs.move_next!
+    value
+  end
+
+  # Executes a *query* that expects at most a single row and returns it read
+  # as *klass* (see `#query_one`), or `nil` if there were no rows.
+  def query_one?(query : String, *args_ : *T, args : Array(A)? = nil, as klass : K.class) : K | Nil | DBError forall T, A, K
+    query_one?(query, *args_, args: args) { |rs| rs.read(klass)! }
+  end
+
+  # Executes a *query* and yields a `ResultSet` positioned at the beginning
+  # of each row, returning an array of the values of the blocks.
+  #
+  # ```
+  # names = db.query_all("select name from contacts") { |rs| rs.read(String)! }
+  # ```
+  def query_all(query : String, *args_ : *T, args : Array(A)? = nil, & : ResultSet -> U) : Array(U) | DBError forall T, A, U
+    ary = [] of U
+    query_each(query, *args_, args: args) do |rs|
+      ary << yield rs
+    end!
+    ary
+  end
+
+  # Executes a *query* and returns an array where each row is read as
+  # *klass* (see `#query_one`).
+  #
+  # ```
+  # names = db.query_all("select name from contacts", as: String)
+  # contacts = db.query_all("select name, age from contacts", as: Tuple(String, Int32))
+  # ```
+  def query_all(query : String, *args_ : *T, args : Array(A)? = nil, as klass : K.class) : Array(K) | DBError forall T, A, K
+    query_all(query, *args_, args: args) { |rs| rs.read(klass)! }
+  end
+
+  # Executes a *query* and yields the `ResultSet` once per each row.
+  # The `ResultSet` is closed when the block is left.
+  #
+  # ```
+  # db.query_each("select name from contacts") do |rs|
+  #   puts rs.read(String)!
+  # end!
+  # ```
+  def query_each(query : String, *args_ : *T, args : Array(A)? = nil, & : ResultSet -> Nil) : Nil | DBError forall T, A
+    rs = query(query, *args_, args: args)!
+    defer rs.close
+    while rs.move_next!
+      yield rs
+    end
+    nil
+  end
+
+  # Performs the *query* and returns an `ExecResult`.
+  def exec(query : String, *args_ : *T, args : Array(A)? = nil) : ExecResult | DBError forall T, A
+    stmt = build(query)!
+    stmt.exec(*args_, args: args)
+  end
+
+  # Performs the *query* and returns a single scalar value.
+  #
+  # ```
+  # puts db.scalar("SELECT MAX(name)")!.as(String)
+  # ```
+  def scalar(query : String, *args_ : *T, args : Array(A)? = nil) : DBValue | DBError forall T, A
+    stmt = build(query)!
+    stmt.scalar(*args_, args: args)
+  end
+end
+
+# Methods shared by session-like objects, `Database` and `Connection`: they
+# run queries through prepared or unprepared statements, by default as
+# `prepared_statements?` says.
+#
+# An implementer answers `Stmt`, its statement type, and has
+# `prepared_statements?`, `prepared_statements_cache?`,
+# `fetch_or_build_prepared_statement(query)` and
+# `build_unprepared_statement(query)`.
+pub trait SessionMethods
+  type Stmt
+
+  # The statement for *query*, prepared or not as the session says. The
+  # statements `QueryMethods` runs are not exposed, so one built without a
+  # cache is closed once it has been used.
+  def build(query : String) : Stmt | DBError
+    if prepared_statements?
+      stmt = fetch_or_build_prepared_statement(query)!
+      if !prepared_statements_cache?
+        stmt.auto_close = true if stmt.responds_to?(:auto_close=)
+      end
+      stmt
+    else
+      build_unprepared_statement(query)
+    end
+  end
+
+  # A value with `QueryMethods` that always prepares its statements.
+  def prepared : PreparedQuery(self, Stmt)
+    PreparedQuery(self, Stmt).new(self)
+  end
+
+  # A prepared statement for *query*, not executed yet.
+  def prepared(query : String) : Stmt | DBError
+    prepared.build(query)
+  end
+
+  # A value with `QueryMethods` that never prepares its statements.
+  def unprepared : UnpreparedQuery(self, Stmt)
+    UnpreparedQuery(self, Stmt).new(self)
+  end
+
+  # An unprepared statement for *query*, not executed yet.
+  def unprepared(query : String) : Stmt | DBError
+    unprepared.build(query)
+  end
+end
+
+# The `QueryMethods` of a session *S* whose statements are *St*, through
+# prepared statements.
+pub struct PreparedQuery(S, St)
+  def initialize(@session : S)
+  end
+
+  def build(query : String) : St | DBError
+    @session.fetch_or_build_prepared_statement(query)
+  end
+end
+
+impl QueryMethods for PreparedQuery(S, St) forall S, St
+end
+
+# The `QueryMethods` of a session *S* whose statements are *St*, through
+# unprepared statements.
+pub struct UnpreparedQuery(S, St)
+  def initialize(@session : S)
+  end
+
+  def build(query : String) : St | DBError
+    @session.build_unprepared_statement(query)
+  end
+end
+
+impl QueryMethods for UnpreparedQuery(S, St) forall S, St
+end
+
+# What `Statement` and `PoolStatement` share. An implementer has
+# `query(*args_, args = nil) : ResultSet | DBError`.
+pub trait StatementMethods
+  # Runs the statement and answers the first column of its first row;
+  # `NoResultsError` when there is none.
+  def scalar(*args_ : *T, args : Array(A)? = nil) : DBValue | DBError forall T, A
+    rs = query(*args_, args: args)!
+    defer rs.close
+    return rs.read if rs.move_next!
+    NoResultsError.new("no results")
+  end
+
+  # Runs the statement and yields its `ResultSet`, closed when the block is
+  # left.
+  def query(*args_ : *T, args : Array(A)? = nil, & : ResultSet -> U) : U | DBError forall T, A, U
+    rs = query(*args_, args: args)!
+    defer rs.close
+    yield rs
+  end
+end
+
+# Begins transactions: a connection, and a transaction for the savepoints
+# nested in it.
+pub trait BeginTransaction
+  # Begins a transaction. It has to be ended with `Transaction#commit` or
+  # `Transaction#rollback`.
+  abstract def begin_transaction : Transaction | DBError
+
+  # Yields a transaction from the current context and ends it when the block
+  # is done. Query the database through `Transaction#connection`.
+  #
+  # The block's value is answered, and the transaction is committed, unless:
+  #
+  # * the block answered an error: the transaction is rolled back and the
+  #   error answered - except `Rollback`, which answers `nil`;
+  # * the block was left early (`return`, `break`, `!`, a panic): the
+  #   transaction is rolled back;
+  # * the block ended the transaction itself with `commit` or `rollback`.
+  #
+  # A rollback that fails is not answered over the block's own error, nor
+  # after an early exit, which has no value to carry it: crystal-db raised
+  # it from its `ensure`, replacing the exception being handled.
+  def transaction(& : Transaction -> T) : T | Nil | DBError forall T
+    tx = begin_transaction!
+    finished = false
+    # parenthesized, so the condition is read when the block is left and not
+    # when the cleanup is registered
+    defer (tx.rollback if !finished && !tx.closed?)
+    value = yield tx
+    finished = true
+    if value.is_a?(::Error)
+      tx.rollback unless tx.closed?
+      return nil if value.is_a?(Rollback)
+      return value
+    end
+    tx.commit! unless tx.closed?
+    value
+  end
+end
+
+# One active connection to a database. Driver implementors subclass it.
+#
+# A program does not build a connection: `IyiDb::Db.connect` opens one, and
+# `Database#checkout` and `Database#using_connection` lend one from the pool.
+# Its `QueryMethods` are documented there.
+#
+# ### Note to implementors
+#
+# The connection is opened by the driver's `ConnectionBuilder#build` and
+# closed in `#do_close`, which calls `super`.
+#
+# Implement `#build_prepared_statement` and `#build_unprepared_statement` to
+# return the driver's `Statement`, and `#driver_name` to return the name the
+# driver is registered with. Override `#server_name` and `#server_version` to
+# expose what the server reports about itself.
+#
+# A connection that is lost answers `ConnectionLost`, so the pool can
+# reconnect or use another connection.
+pub abstract class Connection
+  # How a connection runs its statements. Written out rather than with
+  # `record`, whose struct is not `pub` and so not part of an artifact.
+  pub struct Options
+    # Whether statements are prepared by default
+    getter prepared_statements : Bool
+    # Whether prepared statements are cached
+    getter prepared_statements_cache : Bool
+
+    def initialize(@prepared_statements : Bool = true, @prepared_statements_cache : Bool = true)
+    end
+
+    # The options a connection URI's query string sets, *default* for the
+    # ones it does not.
+    def self.from_http_params(params : Params, default : Options = Options.new) : Options | DBError
+      prepared_statements = fetch_bool(params, "prepared_statements", default.prepared_statements)!
+      prepared_statements_cache = fetch_bool(params, "prepared_statements_cache", default.prepared_statements_cache)!
+      Options.new(
+        prepared_statements: prepared_statements,
+        prepared_statements_cache: prepared_statements_cache,
+      )
+    end
+  end
+
+  @closed = false
+  property context : ConnectionContext = SingleConnectionContext.default
+  @statements_cache : StringKeyCache(Statement)
+  @transaction = false
+  property auto_release : Bool = true
+
+  def initialize(@options : Options)
+    @statements_cache = StringKeyCache(Statement).new
+  end
+
+  def prepared_statements? : Bool
+    @options.prepared_statements
+  end
+
+  def prepared_statements_cache? : Bool
+    @options.prepared_statements_cache
+  end
+
+  def fetch_or_build_prepared_statement(query : String) : Statement | DBError
+    if @options.prepared_statements_cache
+      @statements_cache.fetch(query) { build_prepared_statement(query) }
+    else
+      build_prepared_statement(query)
+    end
+  end
+
+  abstract def build_prepared_statement(query : String) : Statement | DBError
+
+  abstract def build_unprepared_statement(query : String) : Statement | DBError
+
+  # Returns the canonical name of the driver backing this connection: one of
+  # the names the driver registers with `IyiDb::Db.register_driver` (e.g.
+  # `"postgres"`, `"mysql"`, `"sqlite3"`).
+  abstract def driver_name : String
+
+  # Returns the product name the server identifies as (e.g. `"PostgreSQL"`,
+  # `"MariaDB"`), or `nil` if the driver can't tell.
+  def server_name : String?
+    nil
+  end
+
+  # Returns the version string as reported by the server, unparsed (e.g.
+  # `"8.4.9"`, `"12.2.2-MariaDB-ubu2404"`), or `nil` if the driver can't tell.
+  def server_version : String?
+    nil
+  end
+
+  # Begins a transaction on this connection. `Transaction#commit` or
+  # `Transaction#rollback` ends it.
+  def begin_transaction : Transaction | DBError
+    return DBError.new("There is an existing transaction in this connection") if @transaction
+    tx = create_transaction
+    tx.start!
+    @transaction = true
+    tx
+  end
+
+  # The transaction `begin_transaction` starts. A driver overrides it to
+  # answer its own `TopLevelTransaction` subclass.
+  protected def create_transaction : Transaction
+    TopLevelTransaction.new(self)
+  end
+
+  protected def do_close : Nil | DBError
+    @statements_cache.each_value &.close
+    @statements_cache.clear
+    context.discard self
+    nil
+  end
+
+  # Called by the pool when the connection is checked out.
+  def before_checkout : Nil
+    @auto_release = true
+  end
+
+  # Called by the pool when the connection is released.
+  def after_release : Nil
+  end
+
+  # Returns this connection to the pool managed by its database. Only for a
+  # connection obtained by `Database#checkout`.
+  def release : Nil
+    context.release(self)
+  end
+
+  def release_from_statement : Nil
+    release if @auto_release && !@transaction
+  end
+
+  def release_from_transaction : Nil
+    @transaction = false
+  end
+
+  def perform_begin_transaction : Nil | DBError
+    run_unprepared("BEGIN")
+  end
+
+  def perform_commit_transaction : Nil | DBError
+    run_unprepared("COMMIT")
+  end
+
+  def perform_rollback_transaction : Nil | DBError
+    run_unprepared("ROLLBACK")
+  end
+
+  def perform_create_savepoint(name : String) : Nil | DBError
+    run_unprepared("SAVEPOINT #{name}")
+  end
+
+  def perform_release_savepoint(name : String) : Nil | DBError
+    run_unprepared("RELEASE SAVEPOINT #{name}")
+  end
+
+  def perform_rollback_savepoint(name : String) : Nil | DBError
+    run_unprepared("ROLLBACK TO #{name}")
+  end
+
+  private def run_unprepared(sql : String) : Nil | DBError
+    unprepared.exec(sql)!
+    nil
+  end
+end
+
+impl Disposable for Connection
+end
+
+impl QueryMethods for Connection
+end
+
+impl BeginTransaction for Connection
+end
+
+# The `PoolResourceLost` a driver answers when its connection is lost,
+# probably to a socket or network problem. Building it closes the connection;
+# the pool's retry logic then reconnects or uses another one.
+pub class ConnectionLost < PoolResourceLost(Connection)
+  def connection : Connection
+    resource
+  end
+end
+
+# A query in a `Connection`, built by `QueryMethods`.
+#
+# ### Note to implementors
+#
+# 1. Subclass `Statement`; `Connection#build_prepared_statement` and
+#    `#build_unprepared_statement` build it.
+# 2. `#perform_query` executes a query that answers a `ResultSet`.
+# 3. `#perform_exec` executes a query that answers an `ExecResult`.
+# 4. `#do_close` releases the statement's resources, and calls `super`.
+pub abstract class Statement
+  @closed = false
+  getter connection : Connection
+  getter command : String
+  property auto_close : Bool = false
+
+  def initialize(@connection : Connection, @command : String)
+  end
+
+  # Adds *hook* around the execution of every statement, after the ones
+  # added before it. The hook receives the statement, its arguments and a
+  # proc that runs the query; it must call that proc once. crystal-db's
+  # `def_around_query_or_exec` macro, as a registry:
+  #
+  # ```
+  # Statement.def_around_query_or_exec do |stmt, args, run|
+  #   started = Time.monotonic
+  #   run.call
+  #   puts "#{stmt.command} took #{Time.monotonic - started}"
+  # end
+  # ```
+  def self.def_around_query_or_exec(&hook : Statement, Array(DBValue), Proc(Nil) -> Nil) : Nil
+    AROUND_HOOKS.add(hook)
+  end
+
+  # Removes every hook added with `def_around_query_or_exec`.
+  def self.clear_around_query_or_exec : Nil
+    AROUND_HOOKS.clear
+  end
+
+  protected def do_close : Nil | DBError
+    nil
+  end
+
+  def release_from_result_set : Nil | DBError
+    closed = @auto_close ? close : nil
+    release_connection
+    closed
+  end
+
+  def release_connection : Nil
+    @connection.release_from_statement
+  end
+
+  # See `QueryMethods#exec`.
+  def exec(*args_ : *T, args : Array(A)? = nil) : ExecResult | DBError forall T, A
+    perform_exec_and_release(collect_args(args_, args))
+  end
+
+  # See `QueryMethods#query`.
+  def query(*args_ : *T, args : Array(A)? = nil) : ResultSet | DBError forall T, A
+    perform_query_with_rescue(collect_args(args_, args))
+  end
+
+  private def perform_exec_and_release(args : Array(DBValue)) : ExecResult | DBError
+    defer release_connection
+    around_query_or_exec(args) { perform_exec(args).as(ExecResult | DBError) }
+  end
+
+  private def perform_query_with_rescue(args : Array(DBValue)) : ResultSet | DBError
+    # The connection stays checked out while the result set is open; it is
+    # released here only when the query failed, or panicked.
+    answered = false
+    defer (release_connection unless answered)
+    result = around_query_or_exec(args) { perform_query(args).as(ResultSet | DBError) }
+    answered = !result.is_a?(DBError)
+    result
+  end
+
+  protected abstract def perform_query(args : Array(DBValue)) : ResultSet | DBError
+
+  protected abstract def perform_exec(args : Array(DBValue)) : ExecResult | DBError
+
+  # Runs the query or exec in *block*: logs it, then runs it through the
+  # hooks `def_around_query_or_exec` added. A driver may override it and
+  # call `super`.
+  protected def around_query_or_exec(args : Array(DBValue), &block : -> U) : U | DBError forall U
+    emit_log(args)
+    return block.call unless AROUND_HOOKS.any?
+
+    result = nil.as(U?)
+    ran = false
+    run_around_hooks(args, -> do
+      result = block.call
+      ran = true
+      nil
+    end)
+    return DBError.new("a def_around_query_or_exec hook did not run the query") unless ran
+    result.as(U)
+  end
+
+  # Runs *run* inside every hook, the first added outermost.
+  private def run_around_hooks(args : Array(DBValue), run : Proc(Nil)) : Nil
+    hooks = AROUND_HOOKS.hooks
+    index = hooks.size - 1
+    while index >= 0
+      run = wrap_hook(hooks[index], args, run)
+      index -= 1
+    end
+    run.call
+  end
+
+  private def wrap_hook(hook : Proc(Statement, Array(DBValue), Proc(Nil), Nil), args : Array(DBValue), inner : Proc(Nil)) : Proc(Nil)
+    statement = self.as(Statement)
+    -> do
+      hook.call(statement, args, inner)
+      nil
+    end
+  end
+
+  protected def emit_log(args : Array(DBValue)) : Nil
+    LOG.debug { "Executing query -- query: #{command.inspect}, args: #{args_to_log(args)}" }
+  end
+end
+
+impl Disposable for Statement
+end
+
+impl StatementMethods for Statement
+end
+
+# The hooks `Statement.def_around_query_or_exec` adds: one list for every
+# statement class. Module state, not a class variable, which each subclass
+# would hold its own copy of - a driver's statements would never see the
+# hooks added on `Statement`.
+class AroundHooks
+  getter hooks : Array(Proc(Statement, Array(DBValue), Proc(Nil), Nil))
+
+  def initialize
+    @hooks = [] of Proc(Statement, Array(DBValue), Proc(Nil), Nil)
+  end
+
+  def add(hook : Proc(Statement, Array(DBValue), Proc(Nil), Nil)) : Nil
+    @hooks << hook
+  end
+
+  def any? : Bool
+    !@hooks.empty?
+  end
+
+  def clear : Nil
+    @hooks = [] of Proc(Statement, Array(DBValue), Proc(Nil), Nil)
+  end
+end
+
+AROUND_HOOKS = AroundHooks.new
+
+# The rows a query answered. See `IyiDb::Db` for a complete sample.
+#
+# Each `#read` consumes a column and moves to the next one, so columns are
+# read in order. `#move_next` may be called at any time, skipping the rest of
+# the row, and the rows need not all be read.
+#
+# **Note:** depending on how the `ResultSet` was obtained it might have to be
+# closed explicitly. Check `QueryMethods#query`.
+#
+# ### Note to implementors
+#
+# 1. Override `#move_next` to move to the next row.
+# 2. Override `#read` returning the next value in the row.
+# 3. (Optional) Override `#read(t)` for types `t` that need more than a cast.
+# 4. Override `#column_count`, `#column_name` and `#next_column_index`.
+pub abstract class ResultSet
+  @closed = false
+  getter statement : Statement
+
+  def initialize(@statement : Statement)
+  end
+
+  protected def do_close : Nil | DBError
+    statement.release_from_result_set
+  end
+
+  # Iterates over all the rows.
+  def each(& : -> Nil) : Nil | DBError
+    while move_next!
+      yield
+    end
+    nil
+  end
+
+  # Iterates over all the column names.
+  def each_column(& : String -> Nil) : Nil
+    column_count.times { |index| yield column_name(index) }
+  end
+
+  # Moves to the next row: `false` when there are no more.
+  abstract def move_next : Bool | DBError
+
+  # Returns the number of columns in the result.
+  abstract def column_count : Int32
+
+  # Returns the name of the column at the 0-based *index*.
+  abstract def column_name(index : Int32) : String
+
+  # Returns the names of the columns.
+  def column_names : Array(String)
+    names = [] of String
+    each_column { |name| names << name }
+    names
+  end
+
+  # Reads the next column value.
+  abstract def read : DBValue | DBError
+
+  # Returns the index of the column the next `#read` reads; `#column_count`
+  # once the last column of the row has been read.
+  abstract def next_column_index : Int32
+
+  # Reads the next column value as a *type*.
+  #
+  # A `Tuple(...)` or `NamedTuple(...)` type reads one column per member, in
+  # order, crystal-db's `read(String, Int32)` and `read(name: String, age:
+  # Int32)`. An enum is read from a column holding its name or its value. A
+  # type that derives `db_serializable` (or calls `mapping`) is read from the
+  # columns of the current row. Anything else is the value itself, which must
+  # be a *type*: `ColumnTypeMismatchError` when it is not.
+  def read(klass : T.class) : T | DBError forall T
+    # No `!` in this body: a generic body with macros in it is shipped in an
+    # artifact as text, and read back without iyi's `!` (iyi 0.17.0).
+    {% if T < ::Tuple %}
+      {% for member, index in T.type_vars %}
+        __iyi_db_column_{{ index }} = read({{ member }})
+        return __iyi_db_column_{{ index }} if __iyi_db_column_{{ index }}.is_a?(DBError)
+      {% end %}
+      { {% for member, index in T.type_vars %} __iyi_db_column_{{ index }}, {% end %} }
+    {% elsif T < ::NamedTuple %}
+      {% for name, index in T.keys %}
+        __iyi_db_column_{{ index }} = read({{ T[name] }})
+        return __iyi_db_column_{{ index }} if __iyi_db_column_{{ index }}.is_a?(DBError)
+      {% end %}
+      { {% for name, index in T.keys %} {{ name }}: __iyi_db_column_{{ index }}, {% end %} }
+    {% elsif T < ::Enum %}
+      read_enum(klass)
+    {% elsif T.class.has_method?(:from_db_row) %}
+      T.from_db_row(self)
+    {% else %}
+      col_index = next_column_index
+      value = read
+      return value if value.is_a?(DBError)
+      if value.is_a?(T)
+        # `is_a?` narrows a single type and not a union such as `Int32?`, so
+        # the value is cast; and a `.as(String?)` of a `DBValue` reads the
+        # wrong bytes (iyi 0.17.0), so a nilable type answers its nil here
+        # and casts the rest to the type without `Nil`.
+        {% if T.nilable? %}
+          return nil if value.nil?
+          value.as(typeof(value.as(T) || raise("")))
+        {% else %}
+          value.as(T)
+        {% end %}
+      else
+        ColumnTypeMismatchError.new(
+          context: "#{self.class}#read",
+          column_index: col_index,
+          column_name: column_name(col_index),
+          column_type: value.class.to_s,
+          expected_type: T.to_s
+        )
+      end
+    {% end %}
+  end
+
+  # An enum from a column holding a member's name or value.
+  private def read_enum(klass : T.class) : T | DBError forall T
+    index = next_column_index
+    value = read
+    return value if value.is_a?(DBError)
+    case value
+    when String
+      T.parse?(value) || ArgumentError.new("Unknown enum #{T} value: #{value}")
+    when Int
+      T.from_value?(value) || ArgumentError.new("Unknown enum #{T} value: #{value}")
+    else
+      ColumnTypeMismatchError.new(
+        context: "#{T}.new(rs : ResultSet)",
+        column_index: index,
+        column_name: column_name(index),
+        column_type: value.class.to_s,
+        expected_type: "String | Int",
+      )
+    end
+  end
+end
+
+impl Disposable for ResultSet
+end
+
+# A transaction, started from `Database#transaction`,
+# `Connection#transaction` or `Connection#begin_transaction`.
+#
+# Use `Transaction#connection` to submit statements to the database, and
+# `#commit` or `#rollback` to end it explicitly. See
+# `BeginTransaction#transaction` for the block form.
+#
+# Transactions nest through SQL `SAVEPOINT`: `#transaction` and
+# `#begin_transaction` start a nested one.
+pub abstract class Transaction
+  @closed = false
+  @nested_transaction = false
+
+  abstract def connection : Connection
+
+  # Runs what begins the transaction on the database: `BEGIN`, or
+  # `SAVEPOINT` for a nested one.
+  abstract def start : Nil | DBError
+
+  # Runs what commits the transaction on the database.
+  protected abstract def perform_commit : Nil | DBError
+
+  # Runs what rolls the transaction back on the database.
+  protected abstract def perform_rollback : Nil | DBError
+
+  # Commits the transaction. The transaction is over even when the database
+  # refused the commit, and the refusal is answered.
+  def commit : Nil | DBError
+    return DBError.new("Transaction already closed") if closed?
+    performed = perform_commit
+    closed = close
+    performed.is_a?(DBError) ? performed : closed
+  end
+
+  # Rolls the transaction back. The transaction is over even when the
+  # database refused the rollback, and the refusal is answered.
+  def rollback : Nil | DBError
+    return DBError.new("Transaction already closed") if closed?
+    performed = perform_rollback
+    closed = close
+    performed.is_a?(DBError) ? performed : closed
+  end
+
+  # Begins a transaction nested in this one, through a savepoint.
+  def begin_transaction : Transaction | DBError
+    return DBError.new("There is an existing nested transaction in this transaction") if @nested_transaction
+    tx = create_save_point_transaction(self)
+    tx.start!
+    @nested_transaction = true
+    tx
+  end
+
+  def release_from_nested_transaction : Nil
+    @nested_transaction = false
+  end
+
+  # The savepoint transaction nested in *parent*, named after the last one
+  # this top-level transaction made.
+  abstract def create_save_point_transaction(parent : Transaction) : SavePointTransaction
+end
+
+impl Disposable for Transaction
+end
+
+impl BeginTransaction for Transaction
+end
+
+pub class TopLevelTransaction < Transaction
+  getter connection : Connection
+  property savepoint_name : String? = nil
+  @savepoint_prefix : String? = nil
+  @savepoint_count = 0
+
+  def initialize(@connection : Connection)
+  end
+
+  def start : Nil | DBError
+    @connection.perform_begin_transaction
+  end
+
+  protected def perform_commit : Nil | DBError
+    @connection.perform_commit_transaction
+  end
+
+  protected def perform_rollback : Nil | DBError
+    @connection.perform_rollback_transaction
+  end
+
+  protected def do_close : Nil | DBError
+    connection.release_from_transaction
+    nil
+  end
+
+  def create_save_point_transaction(parent : Transaction) : SavePointTransaction
+    prefix = @savepoint_prefix
+    unless prefix
+      # a random prefix, so two runs do not name their savepoints alike
+      prefix = "iyi_#{@connection.object_id}_#{Random.new.rand(10_000)}"
+      @savepoint_prefix = prefix
+    end
+    @savepoint_count += 1
+    name = "#{prefix}_#{@savepoint_count.to_s.rjust(5, '0')}"
+    @savepoint_name = name
+    create_save_point_transaction(parent, name)
+  end
+
+  # The savepoint transaction for *parent* named *savepoint_name*. A driver
+  # overrides it to answer its own `SavePointTransaction` subclass.
+  protected def create_save_point_transaction(parent : Transaction, savepoint_name : String) : SavePointTransaction
+    SavePointTransaction.new(parent, savepoint_name)
+  end
+end
+
+pub class SavePointTransaction < Transaction
+  getter connection : Connection
+  getter savepoint_name : String
+
+  def initialize(@parent : Transaction, @savepoint_name : String)
+    @connection = @parent.connection
+  end
+
+  def start : Nil | DBError
+    @connection.perform_create_savepoint(@savepoint_name)
+  end
+
+  protected def perform_commit : Nil | DBError
+    @connection.perform_release_savepoint(@savepoint_name)
+  end
+
+  protected def perform_rollback : Nil | DBError
+    @connection.perform_rollback_savepoint(@savepoint_name)
+  end
+
+  protected def do_close : Nil | DBError
+    @parent.release_from_nested_transaction
+    nil
+  end
+
+  def create_save_point_transaction(parent : Transaction) : SavePointTransaction
+    @parent.create_save_point_transaction(parent)
+  end
+end
+
+# A connection factory with a specific configuration. See
+# `Driver#connection_builder`.
+pub abstract class ConnectionBuilder
+  # Opens a connection; `ConnectionRefused` when it cannot be established.
+  abstract def build : Connection | DBError
+end
+
+# Database driver implementors subclass `Driver`, register it with a
+# driver name using `IyiDb::Db.register_driver` and implement the factory
+# method `#connection_builder`.
+#
+# ```
+# import db/iyi_db/db
+# import db/iyi_db/core::*
+# import db/iyi_db/errors::{DBError}
+# import std/uri::{URI, Params}
+#
+# class FakeConnectionBuilder < ConnectionBuilder
+#   def initialize(@options : Connection::Options)
+#   end
+#
+#   def build : Connection | DBError
+#     FakeConnection.new(@options)
+#   end
+# end
+#
+# class FakeDriver < Driver
+#   def connection_builder(uri : URI) : ConnectionBuilder | DBError
+#     params = Params.parse(uri.query || "")
+#     options = connection_options(params)!
+#     # If needed, parse custom options from uri here
+#     # so they are parsed only once.
+#     FakeConnectionBuilder.new(options)
+#   end
+# end
+#
+# IyiDb::Db.register_driver "fake", FakeDriver
+# ```
+#
+# Access to this fake database will be available with
+#
+# ```
+# IyiDb::Db.open("fake://...") do |db|
+#   # ... use db ...
+# end
+# ```
+#
+# Refer to `Connection`, `Statement` and `ResultSet` for further driver
+# implementation instructions.
+#
+# Override `#connection_options` and `#pool_options` to provide custom
+# defaults or parsing of the connection string URI.
+pub abstract class Driver
+  def initialize
+  end
+
+  # Returns a new connection factory, or the error in *uri*.
+  #
+  # NOTE: For implementors *uri* should be parsed once. If all the options
+  # are sound a `ConnectionBuilder` is returned.
+  abstract def connection_builder(uri : URI) : ConnectionBuilder | DBError
+
+  def connection_options(params : Params) : Connection::Options | DBError
+    Connection::Options.from_http_params(params)
+  end
+
+  def pool_options(params : Params) : Pool::Options | DBError
+    Pool::Options.from_http_params(params)
+  end
+end
+
+# Acts as an entry point for database access. Connections are managed by a
+# pool. Use `IyiDb::Db.open` to create a `Database`.
+#
+# Refer to `QueryMethods` and `SessionMethods` for querying the database.
+#
+# ## Database URI
+#
+# Connection parameters are usually in a URI. The format is specified by the
+# individual database drivers, yet there are some common properties names
+# usually shared.
+#
+# The connection pool can be configured from URI parameters:
+#
+#   - `initial_pool_size` (default 1)
+#   - `max_pool_size` (default 0 = unlimited)
+#   - `max_idle_pool_size` (default 1)
+#   - `checkout_timeout` (default 5.0)
+#   - `retry_attempts` (default 1)
+#   - `retry_delay` (in seconds, default 0.2)
+#
+# When querying a database, prepared statements are used by default.
+# This can be changed from the `prepared_statements` URI parameter:
+#
+#   - `prepared_statements` (true, or false, default true)
+pub class Database
+  getter pool : Pool(Connection)
+
+  @connection_options : Connection::Options
+  @setup_connection : Proc(Connection, Nil | DBError)
+
+  # Initializes a database with the specified options and connection
+  # factory, for what a URI cannot say, such as a tunnelled connection. No
+  # connection is opened yet: `Database.open` opens the initial ones too.
+  def initialize(connection_options : Connection::Options, pool_options : Pool::Options, &factory : -> Connection | DBError)
+    @connection_options = connection_options
+    @setup_connection = ->(conn : Connection) { nil.as(Nil | DBError) }
+    @pool = uninitialized Pool(Connection) # in order to use self in the factory proc
+    @pool = Pool(Connection).new(pool_options) do
+      conn = factory.call
+      next conn if conn.is_a?(DBError)
+      conn.auto_release = false
+      conn.context = self
+      set_up = @setup_connection.call(conn)
+      if set_up.is_a?(DBError)
+        conn.close
+        next set_up
+      end
+      conn
+    end
+  end
+
+  # A database over the connections *factory* opens, with the initial ones
+  # already open; the error that kept the first of them from opening
+  # otherwise.
+  def self.open(connection_options : Connection::Options, pool_options : Pool::Options, &factory : -> Connection | DBError) : Database | DBError
+    db = Database.new(connection_options, pool_options, &factory)
+    prefilled = db.pool.prefill
+    if prefilled.is_a?(DBError)
+      db.close
+      return prefilled
+    end
+    db
+  end
+
+  def prepared_statements? : Bool
+    @connection_options.prepared_statements
+  end
+
+  def prepared_statements_cache? : Bool
+    @connection_options.prepared_statements_cache
+  end
+
+  # Runs the block every time a new connection is established, and now for
+  # every idle one, yielding the connection. An error from the block keeps
+  # that connection out of the pool and is answered by whatever opened it.
+  #
+  # ```
+  # db = IyiDb::Db.open(DB_URL)!
+  # db.setup_connection do |connection|
+  #   connection.exec("SET TIME ZONE 'America/New_York'")!
+  #   nil
+  # end!
+  # ```
+  def setup_connection(&proc : Connection -> Nil | DBError) : Nil | DBError
+    @setup_connection = proc
+    @pool.each_resource do |conn|
+      set_up = @setup_connection.call(conn)
+      return set_up if set_up.is_a?(DBError)
+    end
+    nil
+  end
+
+  # Closes all connections to the database.
+  def close : Nil
+    @pool.close
+  end
+
+  def fetch_or_build_prepared_statement(query : String) : PoolStatement | DBError
+    PoolPreparedStatement.new(self, query)
+  end
+
+  def build_unprepared_statement(query : String) : PoolStatement | DBError
+    PoolUnpreparedStatement.new(self, query)
+  end
+
+  # Yields a connection from the pool, returned to the pool when the block
+  # ends.
+  def using_connection(& : Connection -> U) : U | DBError forall U
+    connection = checkout!
+    defer connection.release
+    yield connection
+  end
+
+  # Returns a connection from the pool. It must be returned to the pool by
+  # calling `Connection#release`.
+  def checkout : Connection | DBError
+    connection = @pool.checkout!
+    connection.auto_release = false
+    connection
+  end
+
+  # Yields a `Transaction` from a connection of the pool. See
+  # `BeginTransaction#transaction`.
+  def transaction(& : Transaction -> T) : T | Nil | DBError forall T
+    using_connection do |cnn|
+      cnn.transaction { |tx| yield tx }
+    end
+  end
+
+  def retry(& : -> U) : U | DBError forall U
+    @pool.retry { yield }
+  end
+end
+
+impl ConnectionContext for Database
+  def discard(connection : Connection) : Nil
+    @pool.delete connection
+  end
+
+  def release(connection : Connection) : Nil
+    @pool.release connection
+  end
+end
+
+impl QueryMethods for Database
+end
+
+# A statement to be executed on any connection of a database's pool, so a
+# program never has to pick a connection. The execution is retried as the
+# pool is configured.
+pub abstract class PoolStatement
+  def initialize(@db : Database, @query : String)
+  end
+
+  # The query text this statement runs.
+  def command : String
+    @query
+  end
+
+  # Whether the statement is prepared on the connection that runs it.
+  abstract def prepared? : Bool
+
+  # Two pool statements are the same when they are the same query, prepared
+  # or not alike, on the same database.
+  def ==(other : PoolStatement) : Bool
+    prepared? == other.prepared? && @db == other.database && @query == other.command
+  end
+
+  protected def database : Database
+    @db
+  end
+
+  # See `QueryMethods#exec`.
+  def exec(*args_ : *T, args : Array(A)? = nil) : ExecResult | DBError forall T, A
+    statement_with_retry { |stmt| stmt.exec(*args_, args: args) }
+  end
+
+  # See `QueryMethods#query`.
+  def query(*args_ : *T, args : Array(A)? = nil) : ResultSet | DBError forall T, A
+    statement_with_retry { |stmt| stmt.query(*args_, args: args) }
+  end
+
+  # See `QueryMethods#scalar`.
+  def scalar(*args_ : *T, args : Array(A)? = nil) : DBValue | DBError forall T, A
+    statement_with_retry { |stmt| stmt.scalar(*args_, args: args) }
+  end
+
+  # Builds a statement over a connection checked out of the pool.
+  protected abstract def build_statement : Statement | DBError
+
+  private def statement_with_retry(& : Statement -> U) : U | DBError forall U
+    @db.retry do
+      stmt = build_statement
+      next stmt if stmt.is_a?(DBError)
+      yield stmt
+    end
+  end
+end
+
+impl StatementMethods for PoolStatement
+end
+
+# A statement executed on a connection of the pool as a prepared statement.
+pub class PoolPreparedStatement < PoolStatement
+  def initialize(db : Database, query : String)
+    super(db, query)
+  end
+
+  def prepared? : Bool
+    true
+  end
+
+  protected def build_statement : Statement | DBError
+    conn = @db.pool.checkout!
+    stmt = conn.prepared.build(@query)
+    conn.release if stmt.is_a?(DBError)
+    stmt
+  end
+end
+
+# A statement executed on a connection of the pool without preparing it.
+pub class PoolUnpreparedStatement < PoolStatement
+  def initialize(db : Database, query : String)
+    super(db, query)
+  end
+
+  def prepared? : Bool
+    false
+  end
+
+  protected def build_statement : Statement | DBError
+    conn = @db.pool.checkout!
+    stmt = conn.unprepared.build(@query)
+    conn.release if stmt.is_a?(DBError)
+    stmt
+  end
+end
+
+# The statement types answered here, after both are declared: an impl's
+# associated type is resolved where the impl is written.
+impl SessionMethods for Connection
+  type Stmt = Statement
+end
+
+impl SessionMethods for Database
+  type Stmt = PoolStatement
+end
