@@ -1,0 +1,303 @@
+# crystal-db's spec/dummy_driver_spec.cr.
+module iyi_db/dummy_driver_test
+
+import std/slice::{Slice, Bytes}
+import iyi_db/db
+import iyi_db/errors::*
+import iyi_db/value::*
+import iyi_db/core::*
+import iyi_db/spec::{describe, it, expect_error}
+import iyi_db/testing/dummy_driver::*
+
+describe "DummyDriver" do
+  it "with_dummy executes the block with a database" do
+    with_witness do |w|
+      with_dummy do |db|
+        w.check
+        assert db.is_a?(Database)
+      end
+    end
+  end
+
+  describe "DummyDriver::DummyStatement" do
+    it "should enumerate split rows by spaces" do
+      with_dummy do |db|
+        rs = db.query("").or_panic
+        assert !rs.move_next.or_panic
+        rs.close
+
+        rs = db.query("a,b").or_panic
+        assert rs.move_next.or_panic
+        assert !rs.move_next.or_panic
+        rs.close
+
+        rs = db.query("a,b 1,2").or_panic
+        assert rs.move_next.or_panic
+        assert rs.move_next.or_panic
+        assert !rs.move_next.or_panic
+        rs.close
+
+        rs = db.query("a,b 1,2 c,d").or_panic
+        assert rs.move_next.or_panic
+        assert rs.move_next.or_panic
+        assert rs.move_next.or_panic
+        assert !rs.move_next.or_panic
+        rs.close
+      end
+    end
+
+    it "should enumerate string fields" do
+      with_dummy do |db|
+        db.query "a,b 1,2" do |rs|
+          rs.move_next.or_panic
+          assert rs.read(String).or_panic == "a"
+          assert rs.read(String).or_panic == "b"
+          rs.move_next.or_panic
+          assert rs.read(String).or_panic == "1"
+          assert rs.read(String).or_panic == "2"
+        end.or_panic
+      end
+    end
+
+    it "should enumerate nil fields" do
+      with_dummy do |db|
+        db.query "a,NULL 1,NULL" do |rs|
+          rs.move_next.or_panic
+          assert rs.read(String).or_panic == "a"
+          assert rs.read(String | Nil).or_panic.nil?
+          rs.move_next.or_panic
+          assert rs.read(Int64).or_panic == 1
+          assert rs.read(Int64 | Nil).or_panic.nil?
+        end.or_panic
+      end
+    end
+
+    it "should enumerate int64 fields" do
+      with_dummy do |db|
+        db.query "3,4 1,2" do |rs|
+          rs.move_next.or_panic
+          assert rs.read(Int64).or_panic == 3_i64
+          assert rs.read(Int64).or_panic == 4_i64
+          rs.move_next.or_panic
+          assert rs.read(Int64).or_panic == 1_i64
+          assert rs.read(Int64).or_panic == 2_i64
+        end.or_panic
+      end
+    end
+
+    it "should enumerate nillable int64 fields" do
+      with_dummy do |db|
+        db.query "3,4 1,NULL" do |rs|
+          rs.move_next.or_panic
+          assert rs.read(Int64 | Nil).or_panic == 3_i64
+          assert rs.read(Int64 | Nil).or_panic == 4_i64
+          rs.move_next.or_panic
+          assert rs.read(Int64 | Nil).or_panic == 1_i64
+          assert rs.read(Int64 | Nil).or_panic.nil?
+        end.or_panic
+      end
+    end
+
+    describe "query one" do
+      it "queries" do
+        with_dummy do |db|
+          # crystal's `read(Int64, Int64)` / `as: {Int64, Int64}` take a Tuple (NamedTuple) type in iyi
+          assert db.query_one("3,4", &.read(Tuple(Int64, Int64))).or_panic == {3_i64, 4_i64}
+        end
+      end
+
+      it "raises if more than one row" do
+        with_dummy do |db|
+          expect_error(db.query_one("3,4 5,6") { }, DBError, "more than one row")
+          nil
+        end
+      end
+
+      it "raises if no rows" do
+        with_dummy do |db|
+          expect_error(db.query_one("") { }, NoResultsError)
+          nil
+        end
+      end
+
+      it "with as" do
+        with_dummy do |db|
+          assert db.query_one("3,4", as: Tuple(Int64, Int64)).or_panic == {3_i64, 4_i64}
+        end
+      end
+
+      it "with a named tuple" do
+        with_dummy do |db|
+          assert db.query_one("3,4", as: NamedTuple(a: Int64, b: Int64)).or_panic == {a: 3_i64, b: 4_i64}
+        end
+      end
+
+      it "with as, just one" do
+        with_dummy do |db|
+          assert db.query_one("3", as: Int64).or_panic == 3_i64
+        end
+      end
+    end
+
+    describe "query one?" do
+      it "queries" do
+        with_dummy do |db|
+          value = db.query_one?("3,4", &.read(Tuple(Int64, Int64))).or_panic
+          assert value == {3_i64, 4_i64}
+          # crystal checked the static type; the typed local pins it here
+          typed : Tuple(Int64, Int64)? = value
+          assert typed.is_a?(Tuple(Int64, Int64))
+        end
+      end
+
+      it "raises if more than one row" do
+        with_dummy do |db|
+          expect_error(db.query_one?("3,4 5,6") { }, DBError, "more than one row")
+          nil
+        end
+      end
+
+      it "returns nil if no rows" do
+        with_dummy do |db|
+          assert db.query_one?("") { raise "block shouldn't be invoked" }.or_panic.nil?
+        end
+      end
+
+      it "with as" do
+        with_dummy do |db|
+          value = db.query_one?("3,4", as: Tuple(Int64, Int64)).or_panic
+          typed : Tuple(Int64, Int64)? = value
+          assert typed.is_a?(Tuple(Int64, Int64))
+          assert value == {3_i64, 4_i64}
+        end
+      end
+
+      it "with as" do
+        with_dummy do |db|
+          value = db.query_one?("3,4", as: NamedTuple(a: Int64, b: Int64)).or_panic
+          typed : NamedTuple(a: Int64, b: Int64)? = value
+          assert typed.is_a?(NamedTuple(a: Int64, b: Int64))
+          assert value == {a: 3_i64, b: 4_i64}
+        end
+      end
+
+      it "with as, no rows" do
+        with_dummy do |db|
+          value = db.query_one?("", as: NamedTuple(a: Int64, b: Int64)).or_panic
+          assert value.nil?
+        end
+      end
+
+      it "with as, just one" do
+        with_dummy do |db|
+          value = db.query_one?("3", as: Int64).or_panic
+          typed : Int64? = value
+          assert typed.is_a?(Int64)
+          assert value == 3_i64
+        end
+      end
+    end
+
+    describe "query all" do
+      it "queries" do
+        with_dummy do |db|
+          ary = db.query_all("3,4 1,2", &.read(Tuple(Int64, Int64))).or_panic
+          assert ary == [{3_i64, 4_i64}, {1_i64, 2_i64}]
+        end
+      end
+
+      it "queries with as" do
+        with_dummy do |db|
+          ary = db.query_all("3,4 1,2", as: Tuple(Int64, Int64)).or_panic
+          assert ary == [{3_i64, 4_i64}, {1_i64, 2_i64}]
+        end
+      end
+
+      it "queries with a named tuple" do
+        with_dummy do |db|
+          ary = db.query_all("3,4 1,2", as: NamedTuple(a: Int64, b: Int64)).or_panic
+          assert ary == [{a: 3_i64, b: 4_i64}, {a: 1_i64, b: 2_i64}]
+        end
+      end
+
+      it "queries with as, just one" do
+        with_dummy do |db|
+          ary = db.query_all("3 1", as: Int64).or_panic
+          assert ary == [3_i64, 1_i64]
+        end
+      end
+    end
+
+    describe "query each" do
+      it "queries" do
+        with_dummy do |db|
+          i = 0
+          db.query_each "3,4 1,2" do |rs|
+            case i
+            when 0
+              assert rs.read(Tuple(Int64, Int64)).or_panic == {3_i64, 4_i64}
+            when 1
+              assert rs.read(Tuple(Int64, Int64)).or_panic == {1_i64, 2_i64}
+            else
+              raise "unreachable"
+            end
+            i += 1
+          end.or_panic
+          assert i == 2
+        end
+      end
+    end
+
+    it "reads multiple values" do
+      with_dummy do |db|
+        db.query "3,4 1,2" do |rs|
+          rs.move_next.or_panic
+          assert rs.read(Tuple(Int64, Int64)).or_panic == {3_i64, 4_i64}
+          rs.move_next.or_panic
+          assert rs.read(Tuple(Int64, Int64)).or_panic == {1_i64, 2_i64}
+        end.or_panic
+      end
+    end
+
+    it "should enumerate blob fields" do
+      with_dummy do |db|
+        db.query("az,AZ") do |rs|
+          rs.move_next.or_panic
+          ary = [97_u8, 122_u8]
+          assert rs.read(Bytes).or_panic == Bytes.new(ary.size) { |i| ary[i] }
+          ary = [65_u8, 90_u8]
+          assert rs.read(Bytes).or_panic == Bytes.new(ary.size) { |i| ary[i] }
+        end.or_panic
+      end
+    end
+
+    it "should get Nil scalars" do
+      with_dummy do |db|
+        assert db.scalar("NULL").or_panic.nil?
+      end
+    end
+
+    it "should raise executing raise query" do
+      with_dummy do |db|
+        expect_error(db.exec("raise"), DBError)
+        nil
+      end
+    end
+
+    {% for value in [1, 1_i64, "hello", 1.5, 1.5_f32] %}
+      it "should set positional arguments for {{value.id}}" do
+        with_dummy do |db|
+          assert db.scalar("?", {{value}}).or_panic == {{value}}
+        end
+      end
+    {% end %}
+
+    it "executes and selects blob" do
+      with_dummy do |db|
+        ary = [0x53_u8, 0x51_u8, 0x4C_u8]
+        slice = Bytes.new(ary.size) { |i| ary[i] }
+        assert db.scalar("?", slice).or_panic.as(Bytes).to_a == ary
+      end
+    end
+  end
+end
