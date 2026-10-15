@@ -1,0 +1,39 @@
+# crystal-db's spec/disposable_spec.cr.
+module iyi_db/disposable_test
+
+import iyi_db/errors::*
+import iyi_db/core::*
+import iyi_db/spec::{describe, it, expect_error}
+import iyi_db/testing/dummy_driver::*
+
+class ADisposable
+  @closed = false
+  # crystal's `raise` property (`raise` is not a usable name here)
+  property fail = false
+
+  protected def do_close : Nil | DBError
+    return DBError.new("Unable to close") if @fail
+    nil
+  end
+end
+
+impl Disposable for ADisposable
+end
+
+describe "Disposable" do
+  it "should mark as closed if able to close" do
+    obj = ADisposable.new
+    assert !obj.closed?
+    obj.close.or_panic
+    assert obj.closed?
+  end
+
+  it "should not mark as closed if unable to close" do
+    obj = ADisposable.new
+    obj.fail = true
+    assert !obj.closed?
+    # crystal raised from do_close; iyi's close answers the error
+    expect_error(obj.close, DBError, "Unable to close")
+    assert !obj.closed?
+  end
+end

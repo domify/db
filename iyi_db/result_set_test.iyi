@@ -1,0 +1,85 @@
+# crystal-db's spec/result_set_spec.cr.
+module iyi_db/result_set_test
+
+import iyi_db/errors::*
+import iyi_db/core::*
+import iyi_db/spec::{describe, it, expect_error}
+import iyi_db/testing/dummy_driver::*
+
+def closed?(rs : ResultSet?) : Bool
+  if r = rs
+    r.closed?
+  else
+    false
+  end
+end
+
+describe "ResultSet" do
+  it "should enumerate records using each" do
+    nums = [] of Int32
+
+    with_dummy do |db|
+      db.query "3,4 1,2" do |rs|
+        rs.each do
+          nums << rs.read(Int32).or_panic
+          nums << rs.read(Int32).or_panic
+        end.or_panic
+      end.or_panic
+    end
+
+    assert nums == [3, 4, 1, 2]
+  end
+
+  it "should close ResultSet after query" do
+    with_dummy do |db|
+      the_rs : ResultSet? = nil
+      db.query "3,4 1,2" do |rs|
+        the_rs = rs
+      end.or_panic
+      assert closed?(the_rs)
+    end
+  end
+
+  it "should close ResultSet after query even with exception" do
+    with_dummy do |db|
+      the_rs : ResultSet? = nil
+      # no exceptions in iyi: the block answers an error value instead of raising
+      res = db.query "3,4 1,2" do |rs|
+        the_rs = rs
+        DBError.new("dummy")
+      end
+      expect_error(res, DBError, "dummy")
+      assert closed?(the_rs)
+
+      # and leaving the block early
+      the_rs = nil
+      db.query "3,4 1,2" do |rs|
+        the_rs = rs
+        break
+      end
+      assert closed?(the_rs)
+    end
+  end
+
+  it "should enumerate columns" do
+    cols = [] of String
+
+    with_dummy do |db|
+      db.query "3,4 1,2" do |rs|
+        rs.each_column do |col|
+          cols << col
+        end
+      end.or_panic
+    end
+
+    assert cols == ["c0", "c1"]
+  end
+
+  it "gets all column names" do
+    with_dummy do |db|
+      db.query "1,2" do |rs|
+        assert rs.column_names == ["c0", "c1"]
+      end.or_panic
+    end
+  end
+end

@@ -1,0 +1,283 @@
+# crystal-db's spec/database_spec.cr.
+module iyi_db/database_test
+
+import iyi_db/db
+import iyi_db/errors::*
+import iyi_db/core::*
+import iyi_db/spec::{describe, it, expect_error}
+import iyi_db/testing/dummy_driver::*
+
+def connections : Array(DummyConnection)
+  DummyConnection.connections
+end
+
+describe "Database" do
+  it "allows connection initialization" do
+    cnn_setup = [0]
+    IyiDb::Db.open "dummy://localhost:1027?initial_pool_size=2&max_pool_size=4&max_idle_pool_size=1" do |db|
+      # crystal's constructor opened the initial connections; iyi's pool opens them on prefill
+      db.pool.prefill.or_panic
+      assert cnn_setup[0] == 0
+
+      db.setup_connection do |cnn|
+        cnn_setup[0] += 1
+        assert cnn.scalar("a").or_panic == "a"
+        nil
+      end.or_panic
+
+      assert cnn_setup[0] == 2
+
+      db.using_connection do
+        assert cnn_setup[0] == 2
+        db.using_connection do
+          assert cnn_setup[0] == 2
+          db.using_connection do
+            assert cnn_setup[0] == 3
+            db.using_connection do
+              assert cnn_setup[0] == 4
+            end.or_panic
+            # the pool didn't shrink no new initialization should be done next
+            db.using_connection do
+              assert cnn_setup[0] == 4
+            end.or_panic
+          end.or_panic
+          # the pool shrink 1. max_idle_pool_size=1
+          # after the previous end there where 2.
+          db.using_connection do
+            assert cnn_setup[0] == 4
+            # so now there will be a new connection created
+            db.using_connection do
+              assert cnn_setup[0] == 5
+            end.or_panic
+          end.or_panic
+        end.or_panic
+      end.or_panic
+    end.or_panic
+  end
+
+  it "should allow creation of more statements than pool connections" do
+    IyiDb::Db.open "dummy://localhost:1027?initial_pool_size=1&max_pool_size=2" do |db|
+      assert db.build("query1").or_panic.is_a?(PoolPreparedStatement)
+      assert db.build("query2").or_panic.is_a?(PoolPreparedStatement)
+      assert db.build("query3").or_panic.is_a?(PoolPreparedStatement)
+    end.or_panic
+  end
+
+  it "should return same statement in pool per query" do
+    with_dummy do |db|
+      stmt = db.build("query1").or_panic
+      assert db.build("query2").or_panic != stmt
+      assert db.build("query1").or_panic == stmt
+    end
+  end
+
+  it "should not reconnect if connection is lost and retry_attempts=0" do
+    DummyConnection.clear_connections
+    IyiDb::Db.open "dummy://localhost:1027?initial_pool_size=1&max_pool_size=1&retry_attempts=0" do |db|
+      db.exec("stmt1").or_panic
+      assert connections.size == 1
+      connections.first.disconnect
+      expect_error(db.exec("stmt1"), PoolRetryAttemptsExceeded)
+      assert connections.size == 1
+    end.or_panic
+  end
+
+  it "should reconnect if connection is lost and executing same statement" do
+    DummyConnection.clear_connections
+    IyiDb::Db.open "dummy://localhost:1027?initial_pool_size=1&max_pool_size=1&retry_attempts=1" do |db|
+      db.exec("stmt1").or_panic
+      assert connections.size == 1
+      connections.first.disconnect
+      db.exec("stmt1").or_panic
+      assert connections.size == 2
+    end.or_panic
+  end
+
+  it "should allow new connections if pool can increased and retry is not allowed" do
+    DummyConnection.clear_connections
+    IyiDb::Db.open "dummy://localhost:1027?initial_pool_size=1&max_pool_size=2&retry_attempts=0" do |db|
+      db.query("stmt1").or_panic
+      assert connections.size == 1
+      db.query("stmt1").or_panic
+      assert connections.size == 2
+    end.or_panic
+  end
+
+  it "should not return connection to pool if checkout explicitly" do
+    DummyConnection.clear_connections
+    IyiDb::Db.open "dummy://localhost:1027?initial_pool_size=1&max_pool_size=1&retry_attempts=0" do |db|
+      the_cnn : Connection? = nil
+      db.using_connection do |cnn|
+        the_cnn = cnn
+        assert !db.pool.is_available?(cnn)
+        3.times do
+          cnn.exec("stmt1").or_panic
+          assert !db.pool.is_available?(cnn)
+        end
+      end.or_panic
+      if c = the_cnn
+        assert db.pool.is_available?(c)
+      else
+        raise "no connection captured"
+      end
+    end.or_panic
+  end
+
+  it "should checkout different connections until they are released" do
+    DummyConnection.clear_connections
+    IyiDb::Db.open "dummy://localhost:1027?initial_pool_size=1&max_pool_size=2&retry_attempts=0" do |db|
+      the_first_cnn = db.checkout.or_panic
+      the_second_cnn = db.checkout.or_panic
+      assert the_second_cnn != the_first_cnn
+      assert !db.pool.is_available?(the_first_cnn)
+      assert !db.pool.is_available?(the_second_cnn)
+
+      the_first_cnn.release
+      assert db.pool.is_available?(the_first_cnn)
+      assert !db.pool.is_available?(the_second_cnn)
+
+      assert db.checkout.or_panic == the_first_cnn
+      the_first_cnn.release
+      the_second_cnn.release
+    end.or_panic
+  end
+
+  it "should not return explicit checked out connections to the pool after query" do
+    DummyConnection.clear_connections
+    IyiDb::Db.open "dummy://localhost:1027?initial_pool_size=1&max_pool_size=2&retry_attempts=0" do |db|
+      cnn = db.checkout.or_panic
+
+      cnn.query_all("1", as: String).or_panic
+
+      assert !db.pool.is_available?(cnn)
+      cnn.release
+      assert db.pool.is_available?(cnn)
+    end.or_panic
+  end
+
+  it "should return connection to the pool if prepared statement is unable to be built" do
+    with_dummy "dummy://localhost:1027?initial_pool_size=1" do |db|
+      connection = connections.first
+      expect_error(db.prepared.exec("syntax error"), DBError)
+      assert db.pool.is_available?(connection)
+    end
+  end
+
+  it "should return connection to the pool if unprepared statement is unable to be built" do
+    with_dummy "dummy://localhost:1027?initial_pool_size=1" do |db|
+      connection = connections.first
+      expect_error(db.unprepared.exec("syntax error"), DBError)
+      assert db.pool.is_available?(connection)
+    end
+  end
+
+  it "should close connection on ConnectionLost" do
+    DummyConnection.clear_connections
+    IyiDb::Db.open "dummy://localhost:1027?initial_pool_size=1&max_pool_size=1&retry_attempts=1" do |db|
+      db.exec("stmt1").or_panic
+      assert connections.size == 1
+      connection = connections.first
+      connection.disconnect
+      assert !connection.closed?
+      db.exec("stmt1").or_panic
+      # A new connection was used for the last statement
+      assert connections.size == 2
+      assert connection.closed?
+    end.or_panic
+  end
+
+  it "should not checkout multiple connections if there is a statement error" do
+    with_dummy "dummy://localhost:1027?initial_pool_size=1&max_pool_size=10&retry_attempts=10" do |db|
+      expect_error(db.exec("syntax error"), DBError)
+      assert connections.size == 1
+    end
+  end
+
+  it "should attempt all retries if connection is lost" do
+    with_dummy "dummy://localhost:1027?initial_pool_size=1&max_pool_size=1&retry_attempts=10" do |db|
+      expect_error(db.exec("raise ConnectionLost"), PoolRetryAttemptsExceeded)
+      # 1 initial + 10 retries
+      assert connections.size == 11
+    end
+  end
+
+  describe "prepared_statements connection option" do
+    it "defaults to true" do
+      with_dummy "dummy://localhost:1027" do |db|
+        assert db.prepared_statements?
+      end
+    end
+
+    it "can be set to false" do
+      with_dummy "dummy://localhost:1027?prepared_statements=false" do |db|
+        assert !db.prepared_statements?
+      end
+    end
+
+    it "is copied to connections (false)" do
+      with_dummy "dummy://localhost:1027?prepared_statements=false&initial_pool_size=1" do |db|
+        assert !connections.first.prepared_statements?
+      end
+    end
+
+    it "is copied to connections (true)" do
+      with_dummy "dummy://localhost:1027?prepared_statements=true&initial_pool_size=1" do |db|
+        assert connections.first.prepared_statements?
+      end
+    end
+
+    it "should build prepared statements if true" do
+      with_dummy "dummy://localhost:1027?prepared_statements=true" do |db|
+        assert db.build("the query").or_panic.is_a?(PoolPreparedStatement)
+      end
+    end
+
+    it "should build unprepared statements if false" do
+      with_dummy "dummy://localhost:1027?prepared_statements=false" do |db|
+        assert db.build("the query").or_panic.is_a?(PoolUnpreparedStatement)
+      end
+    end
+
+    it "should be overrided by dsl" do
+      with_dummy "dummy://localhost:1027?prepared_statements=true" do |db|
+        stmt = db.unprepared.query("the query").or_panic.statement.as(DummyStatement)
+        assert !stmt.prepared?
+      end
+
+      with_dummy "dummy://localhost:1027?prepared_statements=false" do |db|
+        stmt = db.prepared.query("the query").or_panic.statement.as(DummyStatement)
+        assert stmt.prepared?
+      end
+    end
+  end
+
+  describe "unprepared statements in pool" do
+    it "creating statements should not create new connections" do
+      with_dummy "dummy://localhost:1027?initial_pool_size=1" do |db|
+        stmt1 = db.unprepared.build("query1").or_panic
+        stmt2 = db.unprepared.build("query2").or_panic
+        assert connections.size == 1
+      end
+    end
+
+    it "simultaneous statements should go to different connections" do
+      with_dummy "dummy://localhost:1027?initial_pool_size=1" do |db|
+        rs1 = db.unprepared.query("query1").or_panic
+        rs2 = db.unprepared.query("query2").or_panic
+        assert rs1.statement.connection != rs2.statement.connection
+        assert connections.size == 2
+      end
+    end
+
+    it "sequential statements should go to different connections" do
+      with_dummy "dummy://localhost:1027?initial_pool_size=1" do |db|
+        rs1 = db.unprepared.query("query1").or_panic
+        rs1.close.or_panic
+        rs2 = db.unprepared.query("query2").or_panic
+        rs2.close.or_panic
+        assert rs1.statement.connection == rs2.statement.connection
+        assert connections.size == 1
+      end
+    end
+  end
+end

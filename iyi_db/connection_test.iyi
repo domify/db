@@ -1,0 +1,26 @@
+# crystal-db's spec/connection_spec.cr.
+module iyi_db/connection_test
+
+import iyi_db/core::*
+import iyi_db/spec::{describe, it}
+import iyi_db/testing/dummy_driver::*
+
+describe "Connection" do
+  it "raises on #driver_name if the driver doesn't override it" do
+    with_dummy_connection do |cnn|
+      assert cnn.driver_name == "dummy"
+    end
+  end
+
+  it "returns nil for #server_name if the driver doesn't override it" do
+    with_dummy_connection do |cnn|
+      assert cnn.server_name.nil?
+    end
+  end
+
+  it "returns nil for #server_version if the driver doesn't override it" do
+    with_dummy_connection do |cnn|
+      assert cnn.server_version.nil?
+    end
+  end
+end
