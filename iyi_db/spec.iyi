@@ -1,0 +1,758 @@
+# Testing a driver: crystal-db's `db/spec` (`DB::DriverSpecs`), with the few
+# words a test needs around it.
+#
+# iyi's test runner is `iyi test`: every `*_test.iyi` is a program, and it
+# passes when it exits 0. `describe`, `context` and `it` name the examples;
+# `assert` (the prelude's) and `expect_error` check them. An example that
+# panics is reported by its full name and ends the program with status 1.
+module iyi_db/spec
+
+pub import iyi_db/errors
+pub import iyi_db/value
+pub import iyi_db/core
+
+import std/uri::{URI, Params}
+import std/text
+import iyi_db/db
+import iyi_db/errors::*
+import iyi_db/value::*
+import iyi_db/core::*
+
+class Nesting
+  @path : String
+
+  def initialize
+    @path = ""
+  end
+
+  def path : String
+    @path
+  end
+
+  def path=(value : String) : String
+    @path = value
+  end
+end
+
+NESTING = Nesting.new
+
+def nested(name : String, & : -> Nil) : Nil
+  previous = NESTING.path
+  NESTING.path = previous.empty? ? name : previous + " " + name
+  yield
+  NESTING.path = previous
+end
+
+pub def describe(name : String, & : -> Nil) : Nil
+  nested(name) { yield }
+end
+
+pub def context(name : String, & : -> Nil) : Nil
+  nested(name) { yield }
+end
+
+# Runs the example. It runs as a task, so a panic in it - a failed
+# `assert` - is caught here, reported with the example's full name, and
+# ends the program with status 1.
+pub def it(name : String, &block : -> Nil) : Nil
+  nested(name) do
+    outcome = run_example(block)
+    if outcome.is_a?(Panicked)
+      STDERR.puts "FAIL: #{NESTING.path}"
+      STDERR.puts "  #{outcome.message}"
+      exit 1
+    end
+  end
+end
+
+# `nil` when *block* finished, the `Panicked` it ended with otherwise.
+def run_example(block : Proc(Nil)) : Panicked?
+  group do |g|
+    task = g.spawn do
+      block.call
+      0
+    end
+    value = task.value
+    value.is_a?(Panicked) ? value : nil
+  end
+end
+
+# True when *block* panics. A panic can only be caught at a task boundary,
+# so the block runs as its own task and reading the task's value is the
+# catch. The runtime still prints the panic line to standard error.
+pub def panics?(&block : -> Nil) : Bool
+  !run_example(block).nil?
+end
+
+# Asserts that *value* is an error of type *klass* - and, when *message* is
+# given, that its message is that, or contains it with `partial: true` - and
+# answers it narrowed. crystal-db's specs wrote `expect_raises`.
+pub def expect_error(value : V, klass : T.class, message : String? = nil, *, partial : Bool = false, file : String = __FILE__, line : Int32 = __LINE__) : T forall T, V
+  unless value.is_a?(T)
+    raise("expected #{T}, got #{value.inspect}", file, line)
+  end
+  error = value.as(T)
+  if expected = message
+    text = error.message
+    matches = partial ? text.includes?(expected) : text == expected
+    raise("expected #{T} with message #{expected.inspect}, got #{text.inspect}", file, line) unless matches
+  end
+  error
+end
+
+# Helper class to ensure behaviour of custom drivers.
+#
+# ```
+# import db/iyi_db/spec::{DriverSpecs}
+#
+# DriverSpecs.run do |specs|
+#   # How to connect to database
+#   specs.connection_string "scheme://database_url"
+#
+#   # Clean up database if needed using before/after callbacks
+#   specs.before do
+#     # ...
+#   end
+#
+#   specs.after do
+#     # ...
+#   end
+#
+#   # Sample values that will be stored, retrieved across many specs
+#   specs.sample_value "hello", "varchar(25)", "'hello'"
+#
+#   specs.it "custom spec with a db initialized" do |db|
+#     # assert something using *db*
+#   end
+#
+#   # Configure the appropiate syntax for different commands needed to run the specs
+#   specs.binding_syntax do |index|
+#     "?"
+#   end
+#
+#   specs.create_table_1column_syntax do |table_name, col1|
+#     "create table #{table_name} (#{col1.name} #{col1.sql_type} #{col1.null ? "NULL" : "NOT NULL"})"
+#   end
+# end
+# ```
+#
+# The following methods needs to be called to configure the appropiate
+# syntax for different commands and allow all the specs to run:
+# `binding_syntax`, `create_table_1column_syntax`,
+# `create_table_2columns_syntax`, `select_1column_syntax`,
+# `select_2columns_syntax`, `select_count_syntax`, `select_scalar_syntax`,
+# `insert_1column_syntax`, `insert_2columns_syntax`,
+# `drop_table_if_exists_syntax`.
+#
+# Crystal's `DB::DriverSpecs.run` evaluated its block with the specs as the
+# implicit receiver (`with ctx yield`); iyi has no such block, so the specs
+# arrive as the block's argument.
+pub class DriverSpecs
+  # A column the specs create: its name, SQL type and nullability.
+  pub struct ColumnDef
+    getter name : String
+    getter sql_type : String
+    getter null : Bool
+
+    def initialize(@name : String, @sql_type : String, @null : Bool)
+    end
+  end
+
+  # A sample value: the name of its type, its SQL type, and the driver's
+  # expression for it.
+  pub struct ValueDef
+    getter type_name : String
+    getter value : DBValue
+    getter sql_type : String
+    getter value_encoded : String
+
+    def initialize(@type_name : String, @value : DBValue, @sql_type : String, @value_encoded : String)
+    end
+  end
+
+  # An example: what it says, whether it runs with prepared statements, and
+  # its body.
+  pub struct SpecIt
+    getter description : String
+    getter prepared : Symbol
+    getter file : String
+    getter line : Int32
+    getter block : Proc(Database, Nil)
+
+    def initialize(@description : String, @prepared : Symbol, @file : String, @line : Int32, @block : Proc(Database, Nil))
+    end
+  end
+
+  @before : Proc(Nil)
+  @after : Proc(Nil)
+  @encode_null = "NULL"
+  @support_prepared = true
+  @support_unprepared = true
+  @values : Array(ValueDef)
+  getter its : Array(SpecIt)
+
+  @connection_string : String?
+  @binding_syntax : Proc(Int32, String)?
+  @select_scalar_syntax : Proc(String, String?, String)?
+  @create_table_1column_syntax : Proc(String, ColumnDef, String)?
+  @create_table_2columns_syntax : Proc(String, ColumnDef, ColumnDef, String)?
+  @insert_1column_syntax : Proc(String, ColumnDef, String, String)?
+  @insert_2columns_syntax : Proc(String, ColumnDef, String, ColumnDef, String, String)?
+  @select_1column_syntax : Proc(String, ColumnDef, String)?
+  @select_2columns_syntax : Proc(String, ColumnDef, ColumnDef, String)?
+  @select_count_syntax : Proc(String, String)?
+  @drop_table_if_exists_syntax : Proc(String, String)?
+
+  def initialize
+    @before = -> { }
+    @after = -> { }
+    @values = [] of ValueDef
+    @its = [] of SpecIt
+  end
+
+  def before(&@before : -> Nil) : Nil
+  end
+
+  def after(&@after : -> Nil) : Nil
+  end
+
+  def encode_null(@encode_null : String) : Nil
+  end
+
+  def encode_null : String
+    @encode_null
+  end
+
+  # Allow specs that uses prepared statements (default `true`)
+  def support_prepared(@support_prepared : Bool) : Nil
+  end
+
+  def support_prepared : Bool
+    @support_prepared
+  end
+
+  # Allow specs that uses unprepared statements (default `true`)
+  def support_unprepared(@support_unprepared : Bool) : Nil
+  end
+
+  def support_unprepared : Bool
+    @support_unprepared
+  end
+
+  def connection_string(@connection_string : String) : Nil
+  end
+
+  def connection_string : String
+    @connection_string || raise "Missing connection_string to setup db"
+  end
+
+  def binding_syntax(&@binding_syntax : Int32 -> String) : Nil
+  end
+
+  def binding_syntax : Proc(Int32, String)
+    @binding_syntax || raise "Missing binding_syntax to setup db"
+  end
+
+  def select_scalar_syntax(&@select_scalar_syntax : String, String? -> String) : Nil
+  end
+
+  def select_scalar_syntax : Proc(String, String?, String)
+    @select_scalar_syntax || raise "Missing select_scalar_syntax to setup db"
+  end
+
+  def create_table_1column_syntax(&@create_table_1column_syntax : String, ColumnDef -> String) : Nil
+  end
+
+  def create_table_1column_syntax : Proc(String, ColumnDef, String)
+    @create_table_1column_syntax || raise "Missing create_table_1column_syntax to setup db"
+  end
+
+  def create_table_2columns_syntax(&@create_table_2columns_syntax : String, ColumnDef, ColumnDef -> String) : Nil
+  end
+
+  def create_table_2columns_syntax : Proc(String, ColumnDef, ColumnDef, String)
+    @create_table_2columns_syntax || raise "Missing create_table_2columns_syntax to setup db"
+  end
+
+  def insert_1column_syntax(&@insert_1column_syntax : String, ColumnDef, String -> String) : Nil
+  end
+
+  def insert_1column_syntax : Proc(String, ColumnDef, String, String)
+    @insert_1column_syntax || raise "Missing insert_1column_syntax to setup db"
+  end
+
+  def insert_2columns_syntax(&@insert_2columns_syntax : String, ColumnDef, String, ColumnDef, String -> String) : Nil
+  end
+
+  def insert_2columns_syntax : Proc(String, ColumnDef, String, ColumnDef, String, String)
+    @insert_2columns_syntax || raise "Missing insert_2columns_syntax to setup db"
+  end
+
+  def select_1column_syntax(&@select_1column_syntax : String, ColumnDef -> String) : Nil
+  end
+
+  def select_1column_syntax : Proc(String, ColumnDef, String)
+    @select_1column_syntax || raise "Missing select_1column_syntax to setup db"
+  end
+
+  def select_2columns_syntax(&@select_2columns_syntax : String, ColumnDef, ColumnDef -> String) : Nil
+  end
+
+  def select_2columns_syntax : Proc(String, ColumnDef, ColumnDef, String)
+    @select_2columns_syntax || raise "Missing select_2columns_syntax to setup db"
+  end
+
+  def select_count_syntax(&@select_count_syntax : String -> String) : Nil
+  end
+
+  def select_count_syntax : Proc(String, String)
+    @select_count_syntax || raise "Missing select_count_syntax to setup db"
+  end
+
+  def drop_table_if_exists_syntax(&@drop_table_if_exists_syntax : String -> String) : Nil
+  end
+
+  def drop_table_if_exists_syntax : Proc(String, String)
+    @drop_table_if_exists_syntax || raise "Missing drop_table_if_exists_syntax to setup db"
+  end
+
+  # Adds an example run against a fresh database. *prepared* is `:default`
+  # to run it once as the connection string says, or `:both` to run it with
+  # prepared and with unprepared statements, as far as the driver supports
+  # them.
+  def it(description : String = "assert", prepared : Symbol = :default, file : String = __FILE__, line : Int32 = __LINE__, &block : Database -> Nil) : Nil
+    @its << SpecIt.new(description, prepared, file, line, block)
+  end
+
+  # Use *value* as sample value that should be stored in columns of type
+  # *sql_type*. *value_encoded* is a driver specific expression that should
+  # generate that value in the database. *type_safe_value* indicates whether
+  # *value_encoded* is expected to generate the *value* even without being
+  # stored in a table (default `true`).
+  def sample_value(value : T, sql_type : String, value_encoded : String, *, type_safe_value : Bool = true) : Nil forall T
+    @values << ValueDef.new(T.to_s, value, sql_type, value_encoded)
+
+    it "select nil as (#{T} | Nil)", prepared: :both do |db|
+      db.query(select_scalar(encode_null, nil)) do |rs|
+        assert_single_read rs, T?, nil
+      end.or_panic
+    end
+
+    value_desc = value.to_s
+    value_desc = "#{value_desc[0..25]}...(#{value_desc.size})" if value_desc.size > 25
+    value_desc = "#{value_desc} as #{sql_type}"
+
+    if type_safe_value
+      it "executes with bind #{value_desc}" do |db|
+        assert ok(db.scalar(select_scalar(param(1), sql_type), value)) == value
+      end
+
+      it "executes with bind #{value_desc} as array" do |db|
+        assert ok(db.scalar(select_scalar(param(1), sql_type), args: [value])) == value
+      end
+
+      it "select #{value_desc} as literal" do |db|
+        assert ok(db.scalar(select_scalar(value_encoded, sql_type))) == value
+
+        db.query(select_scalar(value_encoded, sql_type)) do |rs|
+          assert_single_read rs, T, value
+        end.or_panic
+      end
+    end
+
+    it "insert/get value #{value_desc} from table", prepared: :both do |db|
+      c1 = col1(sql_type)
+      db.exec(sql_create_table_table1(c1)).or_panic
+      db.exec(sql_insert_table1(c1, value_encoded)).or_panic
+
+      assert ok(db.query_one(sql_select_table1(c1), as: T)) == value
+    end
+
+    it "insert/get value #{value_desc} from table as nillable", prepared: :both do |db|
+      c1 = col1(sql_type)
+      db.exec(sql_create_table_table1(c1)).or_panic
+      db.exec(sql_insert_table1(c1, value_encoded)).or_panic
+
+      assert ok(db.query_one(sql_select_table1(c1), as: T?)) == value
+    end
+
+    it "insert/get value nil from table as nillable #{sql_type}", prepared: :both do |db|
+      c1 = col1(sql_type, null: true)
+      db.exec(sql_create_table_table1(c1)).or_panic
+      db.exec(sql_insert_table1(c1, encode_null)).or_panic
+
+      assert ok(db.query_one(sql_select_table1(c1), as: T?)).nil?
+    end
+
+    it "insert/get value #{value_desc} from table with binding" do |db|
+      c1 = col1(sql_type_for(String))
+      c2 = col2(sql_type)
+      db.exec(sql_create_table_table2(c1, c2)).or_panic
+      # the next statement will force a union in the *args
+      db.exec(sql_insert_table2(c1, param(1), c2, param(2)), value_for(String), value).or_panic
+      assert ok(db.query_one(sql_select_table2(c2), as: T)) == value
+    end
+
+    it "insert/get value #{value_desc} from table as nillable with binding" do |db|
+      c1 = col1(sql_type_for(String))
+      c2 = col2(sql_type)
+      db.exec(sql_create_table_table2(c1, c2)).or_panic
+      # the next statement will force a union in the *args
+      db.exec(sql_insert_table2(c1, param(1), c2, param(2)), value_for(String), value).or_panic
+      assert ok(db.query_one(sql_select_table2(c2), as: T?)) == value
+    end
+
+    it "insert/get value nil from table as nillable #{sql_type} with binding" do |db|
+      c1 = col1(sql_type_for(String))
+      c2 = col2(sql_type, null: true)
+      db.exec(sql_create_table_table2(c1, c2)).or_panic
+      db.exec(sql_insert_table2(c1, param(1), c2, param(2)), value_for(String), nil).or_panic
+
+      assert ok(db.query_one(sql_select_table2(c2), as: T?)).nil?
+    end
+
+    it "can use read(#{T}) with ResultSet", prepared: :both do |db|
+      c1 = col1(sql_type)
+      db.exec(sql_create_table_table1(c1)).or_panic
+      db.exec(sql_insert_table1(c1, value_encoded)).or_panic
+      db.query(sql_select_table1(c1)) do |rs|
+        assert_single_read rs.as(ResultSet), T, value
+      end.or_panic
+    end
+
+    it "can use read(#{T}?) with ResultSet", prepared: :both do |db|
+      c1 = col1(sql_type)
+      db.exec(sql_create_table_table1(c1)).or_panic
+      db.exec(sql_insert_table1(c1, value_encoded)).or_panic
+      db.query(sql_select_table1(c1)) do |rs|
+        assert_single_read rs.as(ResultSet), T?, value
+      end.or_panic
+    end
+
+    it "can use read(#{T}?) with ResultSet for nil", prepared: :both do |db|
+      c1 = col1(sql_type, null: true)
+      db.exec(sql_create_table_table1(c1)).or_panic
+      db.exec(sql_insert_table1(c1, encode_null)).or_panic
+      db.query(sql_select_table1(c1)) do |rs|
+        assert_single_read rs.as(ResultSet), T?, nil
+      end.or_panic
+    end
+  end
+
+  def include_shared_specs : Nil
+    it "connects using connection_string" do |db|
+      assert db.is_a?(Database)
+    end
+
+    it "can create direct connection" do
+      IyiDb::Db.connect(connection_string) do |cnn|
+        assert cnn.is_a?(Connection)
+        assert ok(cnn.scalar(select_scalar(encode_null, nil))).nil?
+      end.or_panic
+    end
+
+    it "binds nil" do |db|
+      # PG is unable to perform this query without a type annotation
+      assert ok(db.scalar(select_scalar(param(1), sql_type_for(String)), nil)).nil?
+    end
+
+    it "selects nil as scalar", prepared: :both do |db|
+      assert ok(db.scalar(select_scalar(encode_null, nil))).nil?
+    end
+
+    it "gets column count", prepared: :both do |db|
+      db.exec(sql_create_table_person).or_panic
+      db.query("select * from person") do |rs|
+        assert rs.column_count == 2
+      end.or_panic
+    end
+
+    it "gets column name", prepared: :both do |db|
+      db.exec(sql_create_table_person).or_panic
+
+      db.query("select name, age from person") do |rs|
+        assert rs.column_name(0) == "name"
+        assert rs.column_name(1) == "age"
+      end.or_panic
+    end
+
+    it "gets many rows from table" do |db|
+      db.exec(sql_create_table_person).or_panic
+      db.exec(sql_insert_person, "foo", 10).or_panic
+      db.exec(sql_insert_person, "bar", 20).or_panic
+      db.exec(sql_insert_person, "baz", 30).or_panic
+
+      names = [] of String
+      ages = [] of Int32
+      db.query(sql_select_person) do |rs|
+        rs.each do
+          names << ok(rs.read(String))
+          ages << ok(rs.read(Int32))
+        end.or_panic
+      end.or_panic
+      assert names == ["foo", "bar", "baz"]
+      assert ages == [10, 20, 30]
+    end
+
+    it "next_column_index" do |db|
+      db.exec(sql_create_table_person).or_panic
+      db.exec(sql_insert_person, "foo", 10).or_panic
+      db.exec(sql_insert_person, "bar", 20).or_panic
+
+      db.query(sql_select_person) do |rs|
+        rs.move_next.or_panic
+        assert rs.next_column_index == 0
+        rs.read(String).or_panic
+        assert rs.next_column_index == 1
+        rs.read(Int32).or_panic
+        assert rs.next_column_index == 2
+
+        rs.move_next.or_panic
+        assert rs.next_column_index == 0
+        rs.read(String).or_panic
+        assert rs.next_column_index == 1
+        rs.read(Int32).or_panic
+        assert rs.next_column_index == 2
+      end.or_panic
+    end
+
+    it "next_column_index when ColumnTypeMismatchError" do |db|
+      db.exec(sql_create_table_person).or_panic
+      db.exec(sql_insert_person, "foo", 10).or_panic
+      db.exec(sql_insert_person, "bar", 20).or_panic
+
+      db.query(sql_select_person) do |rs|
+        rs.move_next.or_panic
+        assert rs.next_column_index == 0
+        ex = expect_error(rs.read(Int32), ColumnTypeMismatchError)
+        assert ex.column_index == 0
+        assert ex.column_name == "name"
+        # NOTE: sqlite currently returns Int64 due to how Int32 is implemented
+        assert ex.column_type.includes?("String")
+        # NOTE: pg currently returns Slice(UInt8) | String due to how String is implemented
+        assert ex.expected_type.includes?("Int")
+        assert rs.next_column_index == 1
+        ex = expect_error(rs.read(String), ColumnTypeMismatchError)
+        assert ex.column_index == 1
+        assert ex.column_name == "age"
+        # NOTE: sqlite returns Int64
+        assert ex.column_type.includes?("Int")
+        # NOTE: pg currently returns Slice(UInt8) | String due to how String is implemented
+        assert ex.expected_type.includes?("String")
+        assert rs.next_column_index == 2
+
+        rs.move_next.or_panic
+        assert rs.next_column_index == 0
+        expect_error(rs.read(Int32), ColumnTypeMismatchError)
+        assert rs.next_column_index == 1
+        expect_error(rs.read(String), ColumnTypeMismatchError)
+        assert rs.next_column_index == 2
+      end.or_panic
+    end
+
+    it "transactions: can read inside transaction and rollback after" do |db|
+      db.exec(sql_create_table_person).or_panic
+      db.transaction do |tx|
+        assert ok(tx.connection.scalar(sql_select_count_person)) == 0
+        tx.connection.exec(sql_insert_person, "John Doe", 10).or_panic
+        assert ok(tx.connection.scalar(sql_select_count_person)) == 1
+        tx.rollback
+      end.or_panic
+      assert ok(db.scalar(sql_select_count_person)) == 0
+    end
+
+    it "transactions: can read inside transaction or after commit" do |db|
+      db.exec(sql_create_table_person).or_panic
+      db.transaction do |tx|
+        assert ok(tx.connection.scalar(sql_select_count_person)) == 0
+        tx.connection.exec(sql_insert_person, "John Doe", 10).or_panic
+        assert ok(tx.connection.scalar(sql_select_count_person)) == 1
+        # using other connection
+        assert ok(db.scalar(sql_select_count_person)) == 0
+      end.or_panic
+      assert ok(db.scalar("select count(*) from person")) == 1
+    end
+
+    it "nested transactions: can read inside transaction and rollback after" do |db|
+      db.exec(sql_create_table_person).or_panic
+      db.transaction do |tx_0|
+        assert ok(tx_0.connection.scalar(sql_select_count_person)) == 0
+        tx_0.connection.exec(sql_insert_person, "John Doe", 10).or_panic
+        tx_0.transaction do |tx_1|
+          tx_1.connection.exec(sql_insert_person, "Sarah", 11).or_panic
+          assert ok(tx_1.connection.scalar(sql_select_count_person)) == 2
+          tx_1.transaction do |tx_2|
+            tx_2.connection.exec(sql_insert_person, "Jimmy", 12).or_panic
+            assert ok(tx_2.connection.scalar(sql_select_count_person)) == 3
+            tx_2.rollback
+          end.or_panic
+        end.or_panic
+        assert ok(tx_0.connection.scalar(sql_select_count_person)) == 2
+        tx_0.rollback
+      end.or_panic
+      assert ok(db.scalar(sql_select_count_person)) == 0
+    end
+  end
+
+  # Opens the database for one example: `before`, the connection string
+  # with *options* merged into its query, the tables dropped, the example,
+  # and `after` however the example ends.
+  def with_db(options : String? = nil, & : Database -> Nil) : Nil
+    @before.call
+    defer @after.call
+
+    connection_string_with_options = connection_string
+    if extra = options
+      uri = URI.parse(connection_string)
+      params = uri.query_params
+      Params.parse(extra).each { |key, value| params[key] = value }
+      uri.query_params = params
+      connection_string_with_options = uri.to_s
+    end
+
+    IyiDb::Db.open(connection_string_with_options) do |db|
+      db.exec(sql_drop_table("table1")).or_panic
+      db.exec(sql_drop_table("table2")).or_panic
+      db.exec(sql_drop_table("person")).or_panic
+      yield db
+    end.or_panic
+  end
+
+  def select_scalar(expression : String, sql_type : String?) : String
+    select_scalar_syntax.call(expression, sql_type)
+  end
+
+  def param(index : Int32) : String
+    binding_syntax.call(index)
+  end
+
+  def sql_type_for(a_class : Class) : String
+    name = a_class.to_s
+    @values.each { |value| return value.sql_type if value.type_name == name }
+    raise "missing sample_value with #{name}"
+  end
+
+  # The sample value of type *a_class*.
+  def value_for(a_class : T.class) : T forall T
+    name = T.to_s
+    @values.each { |value| return value.value.as(T) if value.type_name == name }
+    raise "missing sample_value with #{name}"
+  end
+
+  def col_name : ColumnDef
+    ColumnDef.new("name", sql_type_for(String), false)
+  end
+
+  def col_age : ColumnDef
+    ColumnDef.new("age", sql_type_for(Int32), false)
+  end
+
+  def sql_create_table_person : String
+    create_table_2columns_syntax.call("person", col_name, col_age)
+  end
+
+  def sql_select_person : String
+    select_2columns_syntax.call("person", col_name, col_age)
+  end
+
+  def sql_insert_person : String
+    insert_2columns_syntax.call("person", col_name, param(1), col_age, param(2))
+  end
+
+  def sql_select_count_person : String
+    select_count_syntax.call("person")
+  end
+
+  def col1(sql_type : String, *, null : Bool = false) : ColumnDef
+    ColumnDef.new("col1", sql_type, null)
+  end
+
+  def col2(sql_type : String, *, null : Bool = false) : ColumnDef
+    ColumnDef.new("col2", sql_type, null)
+  end
+
+  def sql_create_table_table1(col : ColumnDef) : String
+    create_table_1column_syntax.call("table1", col)
+  end
+
+  def sql_create_table_table2(col1 : ColumnDef, col2 : ColumnDef) : String
+    create_table_2columns_syntax.call("table2", col1, col2)
+  end
+
+  def sql_insert_table1(col1 : ColumnDef, expression : String) : String
+    insert_1column_syntax.call("table1", col1, expression)
+  end
+
+  def sql_insert_table2(col1 : ColumnDef, expr1 : String, col2 : ColumnDef, expr2 : String) : String
+    insert_2columns_syntax.call("table2", col1, expr1, col2, expr2)
+  end
+
+  def sql_select_table1(col : ColumnDef) : String
+    select_1column_syntax.call("table1", col)
+  end
+
+  def sql_select_table2(col : ColumnDef) : String
+    select_1column_syntax.call("table2", col)
+  end
+
+  def sql_drop_table(table_name : String) : String
+    drop_table_if_exists_syntax.call(table_name)
+  end
+
+  # Configures the specs in the block, then runs every example under
+  # *description*: the shared ones first registered after the block's. An
+  # example that panics is reported and the program exits with status 1.
+  def self.run(description : String = "as a db", & : DriverSpecs -> Nil) : Nil
+    ctx = DriverSpecs.new
+    yield ctx
+
+    describe description do
+      ctx.include_shared_specs
+
+      ctx.its.each do |db_it|
+        case db_it.prepared
+        when :default
+          ::IyiDb::Spec.it(db_it.description) do
+            ctx.with_db { |db| db_it.block.call(db) }
+          end
+        when :both
+          values = [] of Bool
+          values << true if ctx.support_prepared
+          values << false if ctx.support_unprepared
+          case values.size
+          when 0
+            raise "Neither prepared non unprepared statements allowed"
+          when 1
+            ::IyiDb::Spec.it(db_it.description) do
+              ctx.with_db { |db| db_it.block.call(db) }
+            end
+          else
+            values.each do |prepared_statements|
+              ::IyiDb::Spec.it("#{db_it.description} (prepared_statements=#{prepared_statements})") do
+                ctx.with_db("prepared_statements=#{prepared_statements}") { |db| db_it.block.call(db) }
+              end
+            end
+          end
+        else
+          raise "Invalid prepared value. Allowed values are :both and :default"
+        end
+      end
+    end
+  end
+
+  # The value of a call that must not fail; a failure panics, which fails
+  # the example. A function rather than `.or_panic` in place, because a
+  # `.or_panic` inside a call's arguments does not survive the round trip
+  # through an artifact's shipped body (iyi 0.17.0).
+  private def ok(value : V) forall V
+    value.or_panic
+  end
+
+  private def assert_single_read(rs : ResultSet, value_type : T.class, value : V) : Nil forall T, V
+    moved = ok(rs.move_next)
+    assert moved
+    assert ok(rs.read(value_type)) == value
+    moved = ok(rs.move_next)
+    assert !moved
+  end
+end
