@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # The oldest iyi this release supports (README, Requirements).
+      IYI_VERSION: 0.17.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install iyi
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/iyilang/iyi/master/install.sh | IYI_PREFIX="$HOME/.iyi" sh
+          echo "$HOME/.iyi/bin" >> "$GITHUB_PATH"
+
+      - run: iyi version
+
+      - name: Test
+        run: iyi test iyi_db
+
+      # Every test again, compiled from the .iyimod artifacts a first build
+      # wrote, so the library keeps building module by module (R-1).
+      - name: Test from artifacts
+        run: |
+          for test in iyi_db/*_test.iyi; do
+            mods="$RUNNER_TEMP/mods/$(basename "$test" .iyi)"
+            mkdir -p "$mods"
+            iyi build --emit-iyimod "$mods" "$test" -o "$RUNNER_TEMP/emitted"
+            iyi build --use-iyimod "$mods" "$test" -o "$RUNNER_TEMP/reused"
+            "$RUNNER_TEMP/reused"
+          done
+
+      - name: Build the manual programs
+        run: |
+          for program in manual/*.iyi; do
+            echo "building $program"
+            iyi build "$program" -o "$RUNNER_TEMP/manual"
+          done
+
+      - name: Check formatting
+        run: iyi fmt --check iyi_db manual
+        if: matrix.os == 'ubuntu-24.04'
