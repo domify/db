@@ -1,0 +1,86 @@
+# crystal-db's spec/manual/pool_concurrency_test.cr. To be executed as:
+#
+# % iyi run manual/pool_concurrency.iyi -- --options="max_pool_size=5" --duration=30 --concurrency=4
+#
+module manual/pool_concurrency
+
+import std/option_parser::{OptionParser}
+import std/time::{Time}
+import iyi_db/db
+import iyi_db/testing/dummy_driver::*
+
+options = ""
+duration = 3
+concurrency = 4
+
+parser = OptionParser.new
+banner = "Usage: pool_concurrency_test [arguments]"
+# iyi's `on` takes one flag; the short and the long spelling are registered
+# apart.
+parser.on("-o VALUE", "Connection string options") { |v| options = v }
+parser.on("--options=VALUE", "Connection string options") { |v| options = v }
+parser.on("-d SECONDS", "Specifies the duration in seconds") { |v| duration = v.to_i }
+parser.on("--duration=SECONDS", "Specifies the duration in seconds") { |v| duration = v.to_i }
+parser.on("-c VALUE", "Specifies the concurrent requests to perform") { |v| concurrency = v.to_i }
+parser.on("--concurrency=VALUE", "Specifies the concurrent requests to perform") { |v| concurrency = v.to_i }
+show_help = ->(v : String) do
+  puts banner
+  puts parser.help
+  exit
+end
+parser.on("-h", "Show this help") { |v| show_help.call(v) }
+parser.on("--help", "Show this help") { |v| show_help.call(v) }
+parser.invalid_option do |flag|
+  STDERR.puts "ERROR: #{flag} is not a valid option."
+  STDERR.puts banner
+  STDERR.puts parser.help
+  exit(1)
+end
+parser.parse
+
+# iyi tasks share one thread (no preview_mt counterpart).
+multi_threaded = false
+release = {% if flag?(:release) %} true {% else %} false {% end %}
+
+if !release
+  puts "WARNING: This should be run in release mode."
+end
+
+db = IyiDb::Db.open("dummy://host?#{options}").or_panic
+
+start_time = Time.monotonic
+
+puts "Starting test for #{duration} seconds..."
+
+# crystal's free fibers died with the program; iyi's group waits for its
+# tasks, so they loop until the duration is over.
+running = true
+group do |g|
+  concurrency.times do
+    g.spawn do
+      while running
+        db.scalar "1"
+        sleep 0
+      end
+      0
+    end
+  end
+
+  sleep duration * 1000
+  running = false
+end
+
+end_time = Time.monotonic
+
+puts "          Options : #{options}"
+puts "   Duration (sec) : #{duration} (actual #{end_time - start_time})"
+puts "      Concurrency : #{concurrency}"
+puts "   Multi Threaded : #{multi_threaded ? "Yes (#{multi_threaded})" : "No"}"
+puts "Total Connections : #{DummyConnection.connections_count}"
+puts " Total Statements : #{DummyStatement.statements_count}"
+puts "    Total Queries : #{DummyStatement.statements_exec_count}"
+puts " Throughput (q/s) : #{DummyStatement.statements_exec_count.to_f / duration}"
+
+if !release
+  puts "WARNING: This should be run in release mode."
+end

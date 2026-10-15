@@ -1,0 +1,68 @@
+# crystal-db's spec/manual/load_test.cr. To be executed as:
+#
+# % iyi run manual/load.iyi
+#
+# It generates a number of producers and consumers. If the process hangs
+# it means that the connection pool is not working properly. Likely a race condition.
+#
+module manual/load
+
+import std/text
+import iyi_db/db
+import iyi_db/errors::{DBError}
+import iyi_db/testing/dummy_driver::*
+
+CONNECTION = "dummy://host?initial_pool_size=5&max_pool_size=5&max_idle_pool_size=5"
+
+alias TChannel = Channel(Int32)
+alias TDone = Channel(Bool)
+
+COUNT = 200
+
+def start_consumer(channel : TChannel, done : TDone)
+  indeces = Set(Int32).new
+  while true
+    received = channel.receive
+    break unless received.is_a?(Int32)
+    indeces.add received
+    puts "Received size=#{indeces.size}"
+    break if indeces.size == COUNT
+  end
+  done.send true
+end
+
+# crystal's block-form `DB.open` returned while the producers still ran;
+# here the producers' group keeps the database open until they are done.
+def start_producers(channel : TChannel)
+  IyiDb::Db.open CONNECTION do |db|
+    sql = "1,title,description,2023 " * 100_000
+
+    group do |g|
+      COUNT.times do |index|
+        g.spawn do
+          puts "Sending #{index}"
+          films = db.query_all(sql, as: Tuple(Int32, String, String, Int32))
+          if films.is_a?(DBError)
+            puts "Error: #{films.message}"
+          end
+          channel.send index
+          0
+        end
+      end
+    end
+  end.or_panic
+end
+
+channel = TChannel.new
+done = TDone.new
+group do |g|
+  # crystal's `start_consumer` spawned the consumer itself; an iyi task
+  # belongs to a group, so it is spawned here.
+  g.spawn do
+    start_consumer(channel, done)
+    0
+  end
+  start_producers(channel)
+
+  done.receive
+end
