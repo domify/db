@@ -1,0 +1,173 @@
+# crystal-db's spec/save_point_transaction_spec.cr.
+module iyi_db/save_point_transaction_test
+
+import iyi_db/db
+import iyi_db/errors::*
+import iyi_db/core::*
+import iyi_db/spec::{describe, it, expect_error}
+import iyi_db/testing/dummy_driver::*
+
+def with_dummy_top_transaction(& : DummyTransaction, DummyConnection -> Nil) : Nil
+  with_dummy_connection do |cnn|
+    cnn.transaction do |tx|
+      yield tx.as(DummyTransaction), cnn
+    end.or_panic
+  end
+end
+
+def with_dummy_nested_transaction(& : DummySavePointTransaction, DummyConnection -> Nil) : Nil
+  with_dummy_connection do |cnn|
+    cnn.transaction do |tx|
+      tx.transaction do |nested|
+        yield nested.as(DummySavePointTransaction), cnn
+      end.or_panic
+    end.or_panic
+  end
+end
+
+describe "SavePointTransaction" do
+  {% for context in [:with_dummy_top_transaction, :with_dummy_nested_transaction] %}
+  describe "{{context.id}}" do
+    it "begin/commit transaction from parent transaction" do
+      {{context.id}} do |parent_tx|
+        tx = parent_tx.begin_transaction.or_panic
+        tx.commit.or_panic
+      end
+    end
+
+    it "begin/rollback transaction from parent transaction" do
+      {{context.id}} do |parent_tx|
+        tx = parent_tx.begin_transaction.or_panic
+        tx.rollback.or_panic
+      end
+    end
+
+    it "raise if begin over existing transaction" do
+      {{context.id}} do |parent_tx|
+        parent_tx.begin_transaction.or_panic
+        expect_error(parent_tx.begin_transaction, DBError, "There is an existing nested transaction in this transaction")
+        nil
+      end
+    end
+
+    it "allow sequential transactions" do
+      {{context.id}} do |parent_tx|
+        tx = parent_tx.begin_transaction.or_panic
+        tx.rollback.or_panic
+
+        tx = parent_tx.begin_transaction.or_panic
+        tx.commit.or_panic
+      end
+    end
+
+    it "transaction with block from parent transaction should be committed" do
+      t : DummySavePointTransaction? = nil
+
+      with_witness do |w|
+        {{context.id}} do |parent_tx|
+          parent_tx.transaction do |tx|
+            if tx.is_a?(DummySavePointTransaction)
+              t = tx
+              w.check
+            end
+          end.or_panic
+        end
+      end
+
+      tx = t || raise "no transaction"
+      assert tx.committed
+      assert !tx.rolledback
+    end
+  end
+  {% end %}
+
+  # the nested blocks answer Rollback instead of raising it
+  it "only nested transaction with block from parent transaction should be rolledback if raise DB::Rollback" do
+    top : DummyTransaction? = nil
+    t : DummySavePointTransaction? = nil
+
+    with_witness do |w|
+      with_dummy_top_transaction do |parent_tx|
+        top = parent_tx
+        res = parent_tx.transaction do |tx|
+          if tx.is_a?(DummySavePointTransaction)
+            t = tx
+            w.check
+          end
+          Rollback.new
+        end
+        assert res.nil?
+      end
+    end
+
+    tx = t || raise "no transaction"
+    assert tx.rolledback
+    assert !tx.committed
+
+    top_tx = top || raise "no top transaction"
+    assert !top_tx.rolledback
+    assert top_tx.committed
+  end
+
+  it "only nested transaction with block from parent nested transaction should be rolledback if raise DB::Rollback" do
+    top : DummySavePointTransaction? = nil
+    t : DummySavePointTransaction? = nil
+
+    with_witness do |w|
+      with_dummy_nested_transaction do |parent_tx|
+        top = parent_tx
+        res = parent_tx.transaction do |tx|
+          if tx.is_a?(DummySavePointTransaction)
+            t = tx
+            w.check
+          end
+          Rollback.new
+        end
+        assert res.nil?
+      end
+    end
+
+    tx = t || raise "no transaction"
+    assert tx.rolledback
+    assert !tx.committed
+
+    top_tx = top || raise "no top transaction"
+    assert !top_tx.rolledback
+    assert top_tx.committed
+  end
+
+  it "releasing result_set from within inner transaction should not return connection to pool" do
+    the_cnn : Connection? = nil
+    with_dummy do |db|
+      db.transaction do |tx|
+        tx.transaction do |inner|
+          cnn = inner.connection
+          the_cnn = cnn
+          cnn.scalar("1").or_panic
+          assert !db.pool.is_available?(cnn)
+        end.or_panic
+        assert !db.pool.is_available?(the_cnn || raise "no connection")
+      end.or_panic
+      assert db.pool.is_available?(the_cnn || raise "no connection")
+    end
+  end
+
+  it "releasing result_set from within inner inner transaction should not return connection to pool" do
+    the_cnn : Connection? = nil
+    with_dummy do |db|
+      db.transaction do |tx|
+        tx.transaction do |inner|
+          inner.transaction do |inner_inner|
+            cnn = inner_inner.connection
+            the_cnn = cnn
+            cnn.scalar("1").or_panic
+            assert !db.pool.is_available?(cnn)
+          end.or_panic
+          assert !db.pool.is_available?(the_cnn || raise "no connection")
+        end.or_panic
+        assert !db.pool.is_available?(the_cnn || raise "no connection")
+      end.or_panic
+      assert db.pool.is_available?(the_cnn || raise "no connection")
+    end
+  end
+end

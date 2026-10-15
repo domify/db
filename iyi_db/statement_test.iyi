@@ -1,0 +1,380 @@
+# crystal-db's spec/statement_spec.cr.
+module iyi_db/statement_test
+
+import std/log::{Log, MemoryBackend, Severity}
+import iyi_db/db
+import iyi_db/errors::*
+import iyi_db/core::*
+import iyi_db/spec::{describe, it, expect_error}
+import iyi_db/testing/dummy_driver::*
+
+def dummy_prepared(cnn : DummyConnection, query : String) : DummyStatement
+  cnn.prepared(query).or_panic.as(DummyStatement)
+end
+
+# The debug entries LOG wrote while running the block.
+def capture_log(& : -> Nil) : Array(String)
+  backend = MemoryBackend.new
+  LOG.backend = backend
+  previous_level = LOG.level
+  LOG.level = Severity::Debug
+  defer LOG.backend = nil
+  defer LOG.level = previous_level
+  yield
+  backend.entries.select { |e| e.severity == Severity::Debug }.map { |e| e.message }
+end
+
+describe "Statement" do
+  it "should build prepared statements" do
+    with_dummy_connection do |cnn|
+      prepared = cnn.prepared("the query").or_panic
+      assert prepared.is_a?(Statement)
+      assert prepared.as(DummyStatement).prepared?
+    end
+  end
+
+  it "should build unprepared statements" do
+    with_dummy_connection("prepared_statements=false") do |cnn|
+      prepared = cnn.unprepared("the query").or_panic
+      assert prepared.is_a?(Statement)
+      assert !prepared.as(DummyStatement).prepared?
+    end
+  end
+
+  describe "prepared_statements flag" do
+    it "should build prepared statements if true" do
+      with_dummy_connection("prepared_statements=true") do |cnn|
+        stmt = cnn.query("the query").or_panic.statement
+        assert stmt.as(DummyStatement).prepared?
+      end
+    end
+
+    it "should build unprepared statements if false" do
+      with_dummy_connection("prepared_statements=false") do |cnn|
+        stmt = cnn.query("the query").or_panic.statement
+        assert !stmt.as(DummyStatement).prepared?
+      end
+    end
+  end
+
+  describe "prepared_statements_cache flag" do
+    it "should reuse prepared statements if true" do
+      with_dummy_connection("prepared_statements=true&prepared_statements_cache=true") do |cnn|
+        stmt1 = cnn.query("the query").or_panic.statement
+        stmt2 = cnn.query("the query").or_panic.statement
+        assert stmt1.object_id == stmt2.object_id
+      end
+    end
+
+    it "should leave statements open to be reused if true" do
+      with_dummy_connection("prepared_statements=true&prepared_statements_cache=true") do |cnn|
+        rs = cnn.query("the query").or_panic
+        # do not close while iterating
+        assert !rs.statement.closed?
+        rs.close
+        # do not close to be reused
+        assert !rs.statement.closed?
+      end
+    end
+
+    it "should not reuse prepared statements if false" do
+      with_dummy_connection("prepared_statements=true&prepared_statements_cache=false") do |cnn|
+        stmt1 = cnn.query("the query").or_panic.statement
+        stmt2 = cnn.query("the query").or_panic.statement
+        assert stmt1.object_id != stmt2.object_id
+      end
+    end
+
+    it "should close statements if false" do
+      with_dummy_connection("prepared_statements=true&prepared_statements_cache=false") do |cnn|
+        rs = cnn.query("the query").or_panic
+        # do not close while iterating
+        assert !rs.statement.closed?
+        rs.close
+        # do close after iterating
+        assert rs.statement.closed?
+      end
+    end
+
+    it "should not close statements if false and created explicitly" do
+      with_dummy_connection("prepared_statements=true&prepared_statements_cache=false") do |cnn|
+        stmt = cnn.prepared("the query").or_panic
+
+        rs = stmt.query.or_panic
+        # do not close while iterating
+        assert !stmt.closed?
+        rs.close
+
+        # do not close after iterating
+        assert !stmt.closed?
+      end
+    end
+  end
+
+  it "should initialize positional params in query" do
+    with_dummy_connection do |cnn|
+      stmt = dummy_prepared(cnn, "the query")
+      stmt.query("a", 1, nil).or_panic
+      assert stmt.params[0] == "a"
+      assert stmt.params[1] == 1
+      assert stmt.params[2] == nil
+    end
+  end
+
+  it "accepts array as single argument" do
+    with_dummy_connection do |cnn|
+      stmt = dummy_prepared(cnn, "the query")
+      stmt.query(["a", 1, nil]).or_panic
+      assert stmt.params[0] == ["a", 1, nil]
+    end
+  end
+
+  it "allows no arguments" do
+    with_dummy_connection do |cnn|
+      stmt = dummy_prepared(cnn, "the query")
+      stmt.query.or_panic
+      assert stmt.params.empty?
+    end
+  end
+
+  it "concatenate arguments" do
+    with_dummy_connection do |cnn|
+      stmt = dummy_prepared(cnn, "the query")
+      stmt.query(1, 2, args: ["a", [1, nil]]).or_panic
+      assert stmt.params[0] == 1
+      assert stmt.params[1] == 2
+      assert stmt.params[2] == "a"
+      assert stmt.params[3] == [1, nil]
+    end
+  end
+
+  it "should initialize positional params in query with array" do
+    with_dummy_connection do |cnn|
+      stmt = dummy_prepared(cnn, "the query")
+      stmt.query(args: ["a", 1, nil]).or_panic
+      assert stmt.params[0] == "a"
+      assert stmt.params[1] == 1
+      assert stmt.params[2] == nil
+    end
+  end
+
+  it "should initialize positional params in exec" do
+    with_dummy_connection do |cnn|
+      stmt = dummy_prepared(cnn, "the query")
+      stmt.exec("a", 1, nil).or_panic
+      assert stmt.params[0] == "a"
+      assert stmt.params[1] == 1
+      assert stmt.params[2] == nil
+    end
+  end
+
+  it "accepts array as single argument" do
+    with_dummy_connection do |cnn|
+      stmt = dummy_prepared(cnn, "the query")
+      stmt.exec(["a", 1, nil]).or_panic
+      assert stmt.params[0] == ["a", 1, nil]
+    end
+  end
+
+  it "should initialize positional params in exec with array" do
+    with_dummy_connection do |cnn|
+      stmt = dummy_prepared(cnn, "the query")
+      stmt.exec(args: ["a", 1, nil]).or_panic
+      assert stmt.params[0] == "a"
+      assert stmt.params[1] == 1
+      assert stmt.params[2] == nil
+    end
+  end
+
+  it "allows no arguments" do
+    with_dummy_connection do |cnn|
+      stmt = dummy_prepared(cnn, "the query")
+      stmt.exec.or_panic
+      assert stmt.params.empty?
+    end
+  end
+
+  it "concatenate arguments" do
+    with_dummy_connection do |cnn|
+      stmt = dummy_prepared(cnn, "the query")
+      stmt.exec(1, 2, args: ["a", [1, nil]]).or_panic
+      assert stmt.params[0] == 1
+      assert stmt.params[1] == 2
+      assert stmt.params[2] == "a"
+      assert stmt.params[3] == [1, nil]
+    end
+  end
+
+  it "should initialize positional params in scalar" do
+    with_dummy_connection do |cnn|
+      stmt = dummy_prepared(cnn, "the query")
+      stmt.scalar("a", 1, nil).or_panic
+      assert stmt.params[0] == "a"
+      assert stmt.params[1] == 1
+      assert stmt.params[2] == nil
+    end
+  end
+
+  it "query with block should not close statement" do
+    with_dummy_connection do |cnn|
+      stmt = cnn.prepared("3,4 1,2").or_panic
+      stmt.query.or_panic
+      assert !stmt.closed?
+    end
+  end
+
+  it "closing connection should close statement" do
+    the_stmt : Statement? = nil
+    with_dummy_connection do |cnn|
+      stmt = cnn.prepared("3,4 1,2").or_panic
+      the_stmt = stmt
+      stmt.query.or_panic
+    end
+    assert !!((s = the_stmt) && s.closed?)
+  end
+
+  it "query with block should not close statement" do
+    with_dummy_connection do |cnn|
+      stmt = cnn.prepared("3,4 1,2").or_panic
+      stmt.query do |rs|
+      end.or_panic
+      assert !stmt.closed?
+    end
+  end
+
+  it "query should not close statement" do
+    with_dummy_connection do |cnn|
+      stmt = cnn.prepared("3,4 1,2").or_panic
+      stmt.query do |rs|
+      end.or_panic
+      assert !stmt.closed?
+    end
+  end
+
+  it "scalar should not close statement" do
+    with_dummy_connection do |cnn|
+      stmt = cnn.prepared("3,4 1,2").or_panic
+      stmt.scalar.or_panic
+      assert !stmt.closed?
+    end
+  end
+
+  it "exec should not close statement" do
+    with_dummy_connection do |cnn|
+      stmt = cnn.prepared("3,4 1,2").or_panic
+      stmt.exec.or_panic
+      assert !stmt.closed?
+    end
+  end
+
+  it "connection should cache statements by query" do
+    with_dummy_connection do |cnn|
+      rs = cnn.prepared.query("1, ?", 2).or_panic
+      stmt = rs.statement
+      rs.close
+
+      rs = cnn.prepared.query("1, ?", 4).or_panic
+      assert rs.statement.object_id == stmt.object_id
+    end
+  end
+
+  it "connection should be released if error occurs during exec" do
+    with_dummy do |db|
+      expect_error(db.exec("raise"), DBError)
+      assert DummyConnection.connections.size == 1
+      # crystal computed this and dropped it; asserted here
+      assert db.pool.is_available?(DummyConnection.connections.first)
+    end
+  end
+
+  it "raises NoResultsError for scalar" do
+    with_dummy_connection do |cnn|
+      stmt = cnn.prepared("").or_panic
+      expect_error(stmt.scalar("SELECT LIMIT 0"), NoResultsError)
+      nil
+    end
+  end
+
+  # crystal checks the entries' structured data; iyi's log entries carry the
+  # rendered message (`Executing query -- query: "42", args: []`).
+  describe "logging" do
+    it "exec with no arguments" do
+      messages = capture_log do
+        with_dummy do |db|
+          db.exec("42").or_panic
+        end
+      end
+
+      entries = messages.select(&.includes?("Executing query"))
+      assert entries.size >= 1
+      assert entries[0] == %(Executing query -- query: "42", args: [])
+    end
+
+    it "query with arguments" do
+      messages = capture_log do
+        with_dummy do |db|
+          db.exec("1, ?", args: ["a"]).or_panic
+          db.exec("2, ?", "a").or_panic
+          db.exec("3, ?", ["a"]).or_panic
+        end
+      end
+
+      entries = messages.select(&.includes?("Executing query"))
+      assert entries.size == 3
+      assert entries[0] == %(Executing query -- query: "1, ?", args: ["a"])
+      assert entries[1] == %(Executing query -- query: "2, ?", args: ["a"])
+      assert entries[2] == %(Executing query -- query: "3, ?", args: [["a"]])
+    end
+  end
+
+  # crystal-db reopened `DB::Statement` with `def_around_query_or_exec`; iyi
+  # has no open classes, so the hooks are a registry on `Statement`.
+  describe "def_around_query_or_exec" do
+    it "runs every hook around the driver's statements, the first added outermost" do
+      seen = [] of String
+      Statement.def_around_query_or_exec do |stmt, args, run|
+        seen << "outer before #{stmt.command} #{args.size}"
+        run.call
+        seen << "outer after"
+      end
+      Statement.def_around_query_or_exec do |stmt, args, run|
+        seen << "inner before"
+        run.call
+        seen << "inner after"
+      end
+      defer Statement.clear_around_query_or_exec
+
+      with_dummy do |db|
+        db.exec("1, ?", "a").or_panic
+        assert db.scalar("7").or_panic == 7
+      end
+
+      assert seen == ["outer before 1, ? 1", "inner before", "inner after", "outer after",
+                      "outer before 7 0", "inner before", "inner after", "outer after"]
+    end
+
+    it "answers an error when a hook does not run the query" do
+      Statement.def_around_query_or_exec { |stmt, args, run| }
+      defer Statement.clear_around_query_or_exec
+
+      with_dummy do |db|
+        expect_error(db.exec("1"), DBError, "a def_around_query_or_exec hook did not run the query")
+        nil
+      end
+    end
+
+    it "runs nothing once the hooks are cleared" do
+      count = 0
+      Statement.def_around_query_or_exec do |stmt, args, run|
+        count += 1
+        run.call
+      end
+      Statement.clear_around_query_or_exec
+
+      with_dummy do |db|
+        db.exec("1").or_panic
+      end
+      assert count == 0
+    end
+  end
+end
