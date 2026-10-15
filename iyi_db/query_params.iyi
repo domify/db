@@ -1,0 +1,36 @@
+# Reading connection options out of a URI's query string.
+#
+# A malformed option is an `ArgumentError` the caller sees, where Crystal's
+# `String#to_i` raised.
+module iyi_db/query_params
+
+import std/uri::{Params}
+import std/text
+import iyi_db/errors::*
+
+# The boolean option *name*: `true` or `false` in any case, *default* when it
+# is absent. crystal-db's `DB.fetch_bool`.
+pub def fetch_bool(params : Params, name : String, default : Bool) : Bool | DBError
+  value = params[name]?
+  return default if value.nil?
+  case value.downcase
+  when "true"  then true
+  when "false" then false
+  else
+    ArgumentError.new(%(invalid "#{value}" value for option "#{name}"))
+  end
+end
+
+# The integer option *name*, *default* when it is absent.
+pub def fetch_int(params : Params, name : String, default : Int32) : Int32 | DBError
+  value = params[name]?
+  return default if value.nil?
+  value.to_i? || ArgumentError.new(%(invalid "#{value}" value for option "#{name}"))
+end
+
+# The decimal option *name*, *default* when it is absent.
+pub def fetch_float(params : Params, name : String, default : Float64) : Float64 | DBError
+  value = params[name]?
+  return default if value.nil?
+  value.to_f? || ArgumentError.new(%(invalid "#{value}" value for option "#{name}"))
+end

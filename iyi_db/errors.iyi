@@ -1,0 +1,106 @@
+# Every way a database call can fail, as values (SPEC.md III.1).
+#
+# crystal-db raises `DB::Error` and its subclasses. iyi has no exceptions:
+# a fallible call answers `T | DBError`, `!` hands the error to the caller,
+# and an exhaustive `case` tells the kinds apart. The hierarchy is the one
+# crystal-db has, so `in PoolTimeout` still means what `rescue DB::PoolTimeout`
+# meant, and `in DBError` still catches all of them. A driver adds its own
+# kinds by subclassing `DBError`.
+module iyi_db/errors
+
+# The root of every error this library and its drivers answer. Crystal's
+# `DB::Error`.
+pub class DBError
+  getter message : String
+  # The error this one was raised over, when it wraps another.
+  getter cause : DBError?
+
+  def initialize(@message : String = "", @cause : DBError? = nil)
+  end
+
+  def to_s : String
+    @message
+  end
+
+  def inspect : String
+    "#<#{self.class}: #{@message}>"
+  end
+end
+
+impl Error for DBError
+  def message : String
+    @message
+  end
+end
+
+# A value that could not be read into an object: a missing or unknown
+# column, or a column whose value the property's type cannot hold. Crystal's
+# `DB::MappingException`.
+pub class MappingError < DBError
+  getter klass : String
+  getter property : String?
+
+  def initialize(message : String, @klass : String, @property : String? = nil, cause : DBError? = nil)
+    text = message + "\n  deserializing " + @klass
+    if prop = @property
+      text = text + "#" + prop
+    end
+    super(text, cause)
+  end
+end
+
+# No resource could be checked out of the pool within `checkout_timeout`.
+pub class PoolTimeout < DBError
+end
+
+# Every attempt `Pool#retry` was allowed to make lost its resource.
+pub class PoolRetryAttemptsExceeded < DBError
+end
+
+# A resource of the pool stopped working. Building the error closes the
+# resource, as crystal-db's does, so the pool never hands it out again.
+pub class PoolResourceLost(T) < DBError
+  getter resource : T
+
+  def initialize(@resource : T, cause : DBError? = nil)
+    super("", cause)
+    @resource.close
+  end
+end
+
+# A new resource could not be created. `Pool#retry` tries again.
+pub class PoolResourceRefused < DBError
+end
+
+# A connection could not be established, probably for network or
+# configuration reasons. The pool's retry logic tries again.
+pub class ConnectionRefused < PoolResourceRefused
+end
+
+# The value a `transaction` block answers to have the transaction rolled
+# back without answering an error: the block's error-free counterpart of
+# crystal-db's `raise DB::Rollback.new`.
+pub class Rollback < DBError
+end
+
+# A `scalar` or `query_one` found no row.
+pub class NoResultsError < DBError
+end
+
+# A column held a value of another type than the one asked for.
+pub class ColumnTypeMismatchError < DBError
+  getter column_index : Int32
+  getter column_name : String
+  getter column_type : String
+  getter expected_type : String
+
+  def initialize(*, context : String, @column_index : Int32, @column_name : String, @column_type : String, @expected_type : String)
+    super("In #{context} the column #{column_name} returned a #{column_type} but a #{expected_type} was expected.")
+  end
+end
+
+# An argument the library cannot use: an unknown driver name, a connection
+# option it cannot parse. Crystal's `ArgumentError`, which iyi's prelude does
+# not have.
+pub class ArgumentError < DBError
+end

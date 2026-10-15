@@ -1,0 +1,101 @@
+# The values that cross the boundary between a program and a driver.
+#
+# crystal-db accepts any object as a query argument and lets each driver's
+# overloads decide, and reads whatever union a driver's `read` answers. iyi
+# names that set: `DBValue`, the prelude's scalars, `Time`, `Span`, `Bytes`,
+# arrays of database values, and `CustomValue`, the class a driver's own
+# value types (crystal-pg's geometric types, a driver's `FooValue`) inherit.
+#
+# A union and a class rather than a trait: a trait's implementers are the
+# type a `DBValue` holds, and a driver's types are declared in modules that
+# import this one, which an artifact of this module cannot name (R-1); and
+# an array is a database value for every element type, which only a generic
+# impl could say, making every array anywhere in a program one.
+module iyi_db/value
+
+# `DBValue` names `Time`, `Span` and `Bytes`, so a module that names
+# `DBValue` reaches their modules through this one.
+pub import std/time
+pub import std/slice
+
+import std/time::{Time, Span}
+import std/slice::{Slice, Bytes}
+import std/tuple
+
+# A value of a driver's own type, bound as an argument or read from a
+# column. A driver subclasses it, in its own module.
+pub abstract class CustomValue
+  # How the value is written into the "Executing query" log line; crystal-db
+  # took this from `DB::MetadataValueConverter.arg_to_log` overloads.
+  def to_log : String
+    to_s
+  end
+end
+
+# A value a driver can bind as an argument or answer from `ResultSet#read`.
+pub alias DBValue = Nil | Bool | Char | String | Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float32 | Float64 | Time | Span | Bytes | CustomValue | Array(DBValue)
+
+# The types every driver is expected to read and bind. `DB::TYPES` and
+# `DB::Any` in crystal-db.
+pub alias Any = Nil | String | Bool | Int32 | Int64 | Float32 | Float64 | Time | Bytes
+
+# What an `exec` answers.
+pub struct ExecResult
+  getter rows_affected : Int64
+  getter last_insert_id : Int64
+
+  def initialize(@rows_affected : Int64, @last_insert_id : Int64)
+  end
+end
+
+# *arg* as a `DBValue`: an array element by element, so `[1, nil]` binds as
+# one array argument. A type that is not a database value is refused at
+# compile time, by the cast.
+#
+# One generic function rather than an overload per kind: a call compiles a
+# non-generic method for the argument's own type, which this module's
+# artifact does not carry (iyi 0.17.0).
+pub def to_db_value(arg : T) : DBValue forall T
+  case arg
+  when Array
+    values = [] of DBValue
+    arg.each { |element| values << to_db_value(element) }
+    values
+  else
+    arg.as(DBValue)
+  end
+end
+
+# The positional arguments of a call followed by its `args:` array, as the
+# one list a driver binds. crystal-db's `EnumerableConcat`. An argument that
+# is not a database value is refused here, at compile time.
+pub def collect_args(args_ : Tuple, args : Array(T)?) : Array(DBValue) forall T
+  all = [] of DBValue
+  args_.each { |arg| all << to_db_value(arg) }
+  if extra = args
+    extra.each { |arg| all << to_db_value(arg) }
+  end
+  all
+end
+
+# How *value* is written into the "Executing query" log line: `"a"`, `1`,
+# `nil`, `[1, 2]`, and a `CustomValue`'s `to_log`.
+pub def log_value(value : DBValue) : String
+  case value
+  when Array
+    "[" + value.map { |element| log_value(element) }.join(", ") + "]"
+  when CustomValue
+    value.to_log
+  when Time
+    value.to_s
+  when Span
+    value.to_s
+  else
+    value.inspect
+  end
+end
+
+# The log rendering of a bound argument list: `["a", 1, nil]`.
+pub def args_to_log(args : Array(DBValue)) : String
+  "[" + args.map { |arg| log_value(arg) }.join(", ") + "]"
+end
