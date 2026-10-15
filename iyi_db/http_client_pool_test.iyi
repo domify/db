@@ -1,0 +1,203 @@
+# crystal-db's spec/http_client_pool_spec.cr, with spec/support/http.cr and
+# spec/support/fibers.cr.
+#
+# iyi's std/http has no persistent client, so the experiment is rebuilt on
+# std/socket: a local TCP server reads line-delimited requests
+# (`GET /?delay=0.1`) on each accepted connection, sleeps the requested delay
+# and answers `ok`, counting the requests per connection; `HttpClient` wraps
+# one persistent connection and is pooled as crystal pooled `HTTP::Client`.
+module iyi_db/http_client_pool_test
+
+import std/socket::{IyiSocket}
+import std/time::{Time, Span}
+import iyi_db/pooling::{Pool}
+import iyi_db/spec::{describe, it}
+# crystal's spec_helper loads the dummy driver too; without a Statement
+# subclass in the program iyi_db/core (which iyi_db/spec uses) does not type.
+import iyi_db/testing/dummy_driver::*
+
+# spec/support/http.cr's `wait_for`: `Fiber.yield` is `sleep 0`.
+def wait_for(timeout : Span = Span.seconds(5), &)
+  now = Time.monotonic
+
+  until yield
+    sleep 0
+
+    if (Time.monotonic - now) > timeout
+      raise "block failed to evaluate to true within #{timeout}"
+    end
+  end
+end
+
+# Takes one line off *buffer*, reading *socket* until one is there; nil when
+# the peer closed the connection first.
+def read_line(socket : IyiSocket, buffer : String) : Tuple(String, String)?
+  while true
+    if i = buffer.index('\n')
+      return {buffer[0, i], buffer[i + 1, buffer.size - i - 1]}
+    end
+    chunk = socket.read
+    return nil unless chunk.is_a?(String)
+    return nil if chunk.empty?
+    buffer += chunk
+  end
+end
+
+# The server: crystal's `HTTP::Server` with its handler. Requests are counted
+# per accepted connection, in accept order (crystal keyed a Hash by the
+# client's address; its values come in insertion order too).
+class TestServer
+  getter port : Int32
+  getter requests_per_connection = [] of Int32
+  @listening = false
+
+  def listening? : Bool
+    @listening
+  end
+
+  @stopping = false
+
+  def initialize
+    @listener = IyiSocket.listen("127.0.0.1", 0)
+    @port = @listener.local_port
+  end
+
+  # Accepts until `close`; each connection is served by its own task, and
+  # the handlers' group waits for them to finish (the clients closing).
+  def listen : Nil
+    @listening = true
+    group do |handlers|
+      while true
+        accepted = @listener.accept
+        break unless accepted.is_a?(IyiSocket)
+        conn = accepted
+        if @stopping
+          conn.close
+          break
+        end
+        index = @requests_per_connection.size
+        @requests_per_connection << 0
+        handlers.spawn do
+          serve(conn, index)
+          0
+        end
+      end
+    end
+    @listener.close
+    @listening = false
+  end
+
+  private def serve(conn : IyiSocket, index : Int32) : Nil
+    buffer = ""
+    while got = read_line(conn, buffer)
+      line, buffer = got
+      @requests_per_connection[index] += 1
+      delay = line.split('=')[1].to_f
+      sleep (delay * 1000).to_i32
+      break unless conn.write("ok\n").is_a?(Int32)
+    end
+    conn.close
+  end
+
+  # A parked accept is woken by one last connection, which `listen` turns
+  # away.
+  def close : Nil
+    return unless @listening
+    @stopping = true
+    IyiSocket.connect("127.0.0.1", @port).or_panic.close
+  end
+end
+
+# crystal's `HTTP::Client`: one persistent connection.
+class HttpClient
+  @closed = false
+  @buffer = ""
+  @socket : IyiSocket
+
+  def initialize(port : Int32)
+    @socket = IyiSocket.connect("127.0.0.1", port).or_panic
+  end
+
+  def get(path : String) : String
+    @socket.write("GET #{path}\n").or_panic
+    got = read_line(@socket, @buffer)
+    raise "connection closed by the server" unless got
+    body, @buffer = got
+    body
+  end
+
+  def close : Nil
+    return if @closed
+    @closed = true
+    @socket.close
+  end
+
+  def closed? : Bool
+    @closed
+  end
+end
+
+# spec/support/http.cr's `run_server`: listens in a task, waits until it
+# listens, yields, then closes the server and waits for it to shut down (the
+# group's end).
+def run_server(server : TestServer, &)
+  group do |g|
+    g.spawn do
+      server.listen
+      0
+    end
+    wait_for { server.listening? }
+
+    yield
+    server.close
+  end
+end
+
+describe "IyiDb::Pool" do
+  it "distributes evenly the requests" do
+    server = TestServer.new
+
+    run_server(server) do
+      fixed_pool_size = 5
+      expected_per_connection = 5
+      requests = fixed_pool_size * expected_per_connection
+      port = server.port
+
+      pool = Pool(HttpClient).new(Pool::Options.new(
+        initial_pool_size: fixed_pool_size,
+        max_pool_size: fixed_pool_size,
+        max_idle_pool_size: fixed_pool_size)) {
+        HttpClient.new(port)
+      }
+      pool.prefill.or_panic
+
+      done = Channel(Nil).new
+      all_done = false
+
+      group do |g|
+        requests.times do
+          g.spawn do
+            pool.checkout do |http|
+              http.get("/?delay=0.1")
+            end.or_panic
+            done.send(nil)
+            0
+          end
+        end
+
+        g.spawn do
+          requests.times { done.receive }
+          # crystal closed the channel and waited for `done.closed?`
+          all_done = true
+          0
+        end
+        wait_for { all_done }
+      end
+
+      assert server.requests_per_connection == Array.new(fixed_pool_size, expected_per_connection)
+
+      # the server's handlers end when their clients hang up
+      pool.close
+    end
+  end
+end

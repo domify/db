@@ -1,0 +1,252 @@
+# crystal-db's spec/pool_spec.cr.
+module iyi_db/pool_test
+
+import iyi_db/errors::*
+import iyi_db/core::{Disposable}
+import iyi_db/pooling::{Pool}
+import iyi_db/spec::{describe, it, expect_error}
+# crystal's spec_helper loads the dummy driver too; without a Statement
+# subclass in the program iyi_db/core does not type (see the port report).
+import iyi_db/testing/dummy_driver::*
+
+class ShouldSleepingOp
+  @is_sleeping = false
+  getter is_sleeping
+  getter sleep_happened : Channel(Nil)
+
+  def initialize
+    @sleep_happened = Channel(Nil).new
+  end
+
+  # crystal spawned a free fiber here; iyi tasks live in a group, which waits
+  # for the sleeper at its end.
+  def should_sleep(&)
+    s = self
+    @is_sleeping = true
+    group do |g|
+      g.spawn do
+        sleep 100
+        assert s.is_sleeping
+        s.sleep_happened.send(nil)
+        0
+      end
+      yield
+      @is_sleeping = false
+    end
+  end
+
+  def wait_for_sleep
+    @sleep_happened.receive
+  end
+end
+
+class WaitFor
+  def initialize
+    @channel = Channel(Nil).new
+  end
+
+  def wait
+    @channel.receive
+  end
+
+  def check
+    @channel.send(nil)
+  end
+end
+
+class Closable
+  @closed = false
+  property before_checkout_called : Bool = false
+  property after_release_called : Bool = false
+
+  protected def do_close : Nil | DBError
+    nil
+  end
+
+  def before_checkout
+    @before_checkout_called = true
+  end
+
+  def after_release
+    @after_release_called = true
+  end
+end
+
+impl Disposable for Closable
+end
+
+# Crystal's `Pool.new` opened the `initial_pool_size` resources itself; iyi's
+# `prefill` does it.
+def create_pool(options : Pool::Options = Pool::Options.new, &factory : -> Closable) : Pool(Closable)
+  pool = Pool(Closable).new(options) { factory.call }
+  pool.prefill.or_panic
+  pool
+end
+
+describe "IyiDb::Pool" do
+  it "should use proc to create objects" do
+    block_called = 0
+    pool = create_pool(Pool::Options.new(initial_pool_size: 3)) { block_called += 1; Closable.new }
+    assert block_called == 3
+  end
+
+  it "should get resource" do
+    pool = create_pool { Closable.new }
+    resource = pool.checkout.or_panic
+    assert resource.is_a?(Closable)
+    assert resource.before_checkout_called
+  end
+
+  it "should be available if not checkedout" do
+    resource : Closable? = nil
+    pool = create_pool(Pool::Options.new(initial_pool_size: 1)) { c = Closable.new; resource = c; c }
+    r = resource
+    assert !r.nil? && pool.is_available?(r)
+  end
+
+  it "should not be available if checkedout" do
+    pool = create_pool { Closable.new }
+    resource = pool.checkout.or_panic
+    assert !pool.is_available?(resource)
+  end
+
+  it "should be available if returned" do
+    pool = create_pool { Closable.new }
+    resource = pool.checkout.or_panic
+    assert !resource.after_release_called
+    pool.release resource
+    assert pool.is_available?(resource)
+    assert resource.after_release_called
+  end
+
+  it "should wait for available resource" do
+    pool = create_pool(Pool::Options.new(max_pool_size: 1, initial_pool_size: 1)) { Closable.new }
+
+    b_cnn_request = ShouldSleepingOp.new
+    wait_a = WaitFor.new
+    wait_b = WaitFor.new
+
+    group do |g|
+      g.spawn do
+        a_cnn = pool.checkout.or_panic
+        b_cnn_request.wait_for_sleep
+        pool.release a_cnn
+
+        wait_a.check
+        0
+      end
+
+      g.spawn do
+        b_cnn_request.should_sleep do
+          pool.checkout.or_panic
+        end
+
+        wait_b.check
+        0
+      end
+
+      wait_a.wait
+      wait_b.wait
+    end
+  end
+
+  it "should create new if max was not reached" do
+    block_called = 0
+    pool = create_pool(Pool::Options.new(max_pool_size: 2, initial_pool_size: 1)) { block_called += 1; Closable.new }
+    assert block_called == 1
+    pool.checkout.or_panic
+    assert block_called == 1
+    pool.checkout.or_panic
+    assert block_called == 2
+  end
+
+  it "should reuse returned resources" do
+    all = [] of Closable
+    pool = create_pool(Pool::Options.new(max_pool_size: 2, initial_pool_size: 1)) { c = Closable.new; all << c; c }
+    pool.checkout.or_panic
+    b1 = pool.checkout.or_panic
+    pool.release b1
+    b2 = pool.checkout.or_panic
+
+    assert b1 == b2
+    assert all.size == 2
+  end
+
+  it "should close available and total" do
+    all = [] of Closable
+    pool = create_pool(Pool::Options.new(max_pool_size: 2, initial_pool_size: 1)) { c = Closable.new; all << c; c }
+    a = pool.checkout.or_panic
+    b = pool.checkout.or_panic
+    pool.release b
+    assert all.size == 2
+
+    assert !all[0].closed?
+    assert !all[1].closed?
+    pool.close
+    assert all[0].closed?
+    assert all[1].closed?
+  end
+
+  it "should timeout" do
+    pool = create_pool(Pool::Options.new(max_pool_size: 1, checkout_timeout: 0.1)) { Closable.new }
+    pool.checkout.or_panic
+    expect_error(pool.checkout, PoolTimeout)
+  end
+
+  it "should be able to release after a timeout" do
+    pool = create_pool(Pool::Options.new(max_pool_size: 1, checkout_timeout: 0.1)) { Closable.new }
+    a = pool.checkout.or_panic
+    pool.checkout # crystal: `rescue nil`; the error value is dropped
+    pool.release a
+  end
+
+  it "should close if max idle amount is reached" do
+    all = [] of Closable
+    pool = create_pool(Pool::Options.new(max_pool_size: 3, max_idle_pool_size: 1)) { c = Closable.new; all << c; c }
+    pool.checkout.or_panic
+    pool.checkout.or_panic
+    pool.checkout.or_panic
+
+    assert all.size == 3
+    assert !all.any?(&.closed?)
+    pool.release all[0]
+
+    assert !all.any?(&.closed?)
+    pool.release all[1]
+
+    assert !all[0].closed?
+    assert all[1].closed?
+    assert !all[2].closed?
+  end
+
+  it "should not return closed resources to the pool" do
+    pool = create_pool(Pool::Options.new(max_pool_size: 1, max_idle_pool_size: 1)) { Closable.new }
+
+    # pool size 1 should be reusing the one resource
+    resource1 = pool.checkout.or_panic
+    pool.release resource1
+    resource2 = pool.checkout.or_panic
+    assert resource1 == resource2
+
+    # it should not return a closed resource to the pool
+    resource2.close
+    pool.release resource2
+
+    resource2 = pool.checkout.or_panic
+    assert resource1 != resource2
+  end
+
+  it "should create resource after max_pool was reached if idle forced some close up" do
+    all = [] of Closable
+    pool = create_pool(Pool::Options.new(max_pool_size: 3, max_idle_pool_size: 1)) { c = Closable.new; all << c; c }
+    pool.checkout.or_panic
+    pool.checkout.or_panic
+    pool.checkout.or_panic
+    pool.release all[0]
+    pool.release all[1]
+    pool.checkout.or_panic
+    pool.checkout.or_panic
+
+    assert all.size == 4
+  end
+end
