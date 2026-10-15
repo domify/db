@@ -1,0 +1,365 @@
+# crystal-db's spec/custom_drivers_types_spec.cr.
+module iyi_db/custom_drivers_types_test
+
+import std/uri::{URI, Params}
+import std/text
+import std/slice::{Slice, Bytes}
+import std/time::{Time}
+import iyi_db/db
+import iyi_db/errors::*
+import iyi_db/value::*
+import iyi_db/core::*
+import iyi_db/spec::{describe, it, expect_error}
+import iyi_db/testing/dummy_driver::{with_witness}
+
+# A driver's own value type is a `CustomValue` subclass (crystal: any class).
+class FooValue < CustomValue
+  def initialize(@value : Int32)
+  end
+
+  def value
+    @value
+  end
+end
+
+alias FooAny = Any | FooValue
+
+class FooDriver < Driver
+  class FooConnectionBuilder < ConnectionBuilder
+    def initialize(@options : Connection::Options)
+    end
+
+    def build : Connection | DBError
+      FooConnection.new(@options)
+    end
+  end
+
+  @@row = [] of FooAny
+
+  def self.fake_row=(row : Array(FooAny))
+    @@row = row
+  end
+
+  def self.fake_row : Array(FooAny)
+    @@row
+  end
+
+  def connection_builder(uri : URI) : ConnectionBuilder | DBError
+    params = Params.parse(uri.query || "")
+    FooConnectionBuilder.new(connection_options(params)!)
+  end
+
+  class FooConnection < Connection
+    def build_prepared_statement(query : String) : Statement | DBError
+      FooStatement.new(self, query)
+    end
+
+    def build_unprepared_statement(query : String) : Statement | DBError
+      DBError.new("not implemented")
+    end
+
+    def driver_name : String
+      "foo"
+    end
+  end
+
+  class FooStatement < Statement
+    protected def perform_query(args : Array(DBValue)) : ResultSet | DBError
+      args.each { |arg| process_arg(arg)! }
+      FooResultSet.new(self, FooDriver.fake_row)
+    end
+
+    protected def perform_exec(args : Array(DBValue)) : ExecResult | DBError
+      args.each { |arg| process_arg(arg)! }
+      ExecResult.new 0i64, 0i64
+    end
+
+    # crystal's two `process_arg` overloads (the second raising): the
+    # parameters are `DBValue`s here, so the types this driver binds - `Any`
+    # and `FooValue` - are told apart from the rest at run time and anything
+    # else answers the error.
+    private def process_arg(value : DBValue) : Nil | DBError
+      return nil if value.is_a?(Any) || value.is_a?(FooValue)
+      DBError.new("#{self.class} does not support #{value.class} params")
+    end
+  end
+
+  class FooResultSet < ResultSet
+    # crystal's `include GenericResultSet`
+    @index = 0
+
+    def move_next : Bool | DBError
+      @index = 0
+      true
+    end
+
+    def column_count : Int32
+      @row.size
+    end
+
+    def column_name(index : Int32) : String
+      index.to_s
+    end
+
+    def read : DBValue | DBError
+      @index += 1
+      @row[@index - 1]
+    end
+
+    def next_column_index : Int32
+      @index
+    end
+
+    def initialize(statement : Statement, @row : Array(FooAny))
+      super(statement)
+    end
+  end
+end
+
+IyiDb::Db.register_driver "foo", FooDriver
+
+class BarValue < CustomValue
+  getter value : Int32
+
+  def initialize(@value : Int32)
+  end
+end
+
+alias BarAny = Any | BarValue
+
+class BarDriver < Driver
+  class BarConnectionBuilder < ConnectionBuilder
+    def initialize(@options : Connection::Options)
+    end
+
+    def build : Connection | DBError
+      BarConnection.new(@options)
+    end
+  end
+
+  @@row = [] of BarAny
+
+  def self.fake_row=(row : Array(BarAny))
+    @@row = row
+  end
+
+  def self.fake_row : Array(BarAny)
+    @@row
+  end
+
+  def connection_builder(uri : URI) : ConnectionBuilder | DBError
+    params = Params.parse(uri.query || "")
+    BarConnectionBuilder.new(connection_options(params)!)
+  end
+
+  class BarConnection < Connection
+    def build_prepared_statement(query : String) : Statement | DBError
+      BarStatement.new(self, query)
+    end
+
+    def build_unprepared_statement(query : String) : Statement | DBError
+      DBError.new("not implemented")
+    end
+
+    def driver_name : String
+      "bar"
+    end
+  end
+
+  class BarStatement < Statement
+    protected def perform_query(args : Array(DBValue)) : ResultSet | DBError
+      args.each { |arg| process_arg(arg)! }
+      BarResultSet.new(self, BarDriver.fake_row)
+    end
+
+    protected def perform_exec(args : Array(DBValue)) : ExecResult | DBError
+      args.each { |arg| process_arg(arg)! }
+      ExecResult.new 0i64, 0i64
+    end
+
+    # See FooStatement#process_arg.
+    private def process_arg(value : DBValue) : Nil | DBError
+      return nil if value.is_a?(Any) || value.is_a?(BarValue)
+      DBError.new("#{self.class} does not support #{value.class} params")
+    end
+  end
+
+  class BarResultSet < ResultSet
+    # crystal's `include GenericResultSet`
+    @index = 0
+
+    def move_next : Bool | DBError
+      @index = 0
+      true
+    end
+
+    def column_count : Int32
+      @row.size
+    end
+
+    def column_name(index : Int32) : String
+      index.to_s
+    end
+
+    def read : DBValue | DBError
+      @index += 1
+      @row[@index - 1]
+    end
+
+    def next_column_index : Int32
+      @index
+    end
+
+    def initialize(statement : Statement, @row : Array(BarAny))
+      super(statement)
+    end
+  end
+end
+
+IyiDb::Db.register_driver "bar", BarDriver
+
+describe "IyiDb" do
+  it "should be able to register multiple drivers" do
+    assert IyiDb::Db.open("foo://host").or_panic.checkout.or_panic.is_a?(FooDriver::FooConnection)
+    assert IyiDb::Db.open("bar://host").or_panic.checkout.or_panic.is_a?(BarDriver::BarConnection)
+  end
+
+  it "Foo and Bar drivers should return fake_row" do
+    with_witness do |w|
+      IyiDb::Db.open("foo://host") do |db|
+        FooDriver.fake_row = [1, "string", FooValue.new(3)] of FooAny
+        db.query "query" do |rs|
+          w.check
+          rs.move_next.or_panic
+          assert rs.read(Int32).or_panic == 1
+          assert rs.read(String).or_panic == "string"
+          assert rs.read(FooValue).or_panic.value == 3
+        end.or_panic
+      end.or_panic
+    end
+
+    with_witness do |w|
+      IyiDb::Db.open("bar://host") do |db|
+        BarDriver.fake_row = [BarValue.new(4), "lorem", 1.0] of BarAny
+        db.query "query" do |rs|
+          w.check
+          rs.move_next.or_panic
+          assert rs.read(BarValue).or_panic.value == 4
+          assert rs.read(String).or_panic == "lorem"
+          assert rs.read(Float64).or_panic == 1.0
+        end.or_panic
+      end.or_panic
+    end
+  end
+
+  it "drivers should return custom values as scalar" do
+    IyiDb::Db.open("foo://host") do |db|
+      FooDriver.fake_row = [FooValue.new(3)] of FooAny
+      assert db.scalar("query").or_panic.as(FooValue).value == 3
+    end.or_panic
+  end
+
+  # class names are fully qualified in iyi: the stable parts are matched
+  it "Foo and Bar drivers should not implement each other read" do
+    with_witness do |w|
+      IyiDb::Db.open("foo://host") do |db|
+        FooDriver.fake_row = [1] of FooAny
+        db.query "query" do |rs|
+          rs.move_next.or_panic
+          w.check
+          err = expect_error(rs.read(BarValue), ColumnTypeMismatchError, "FooDriver::FooResultSet#read the column 0 returned a Int32 but a ", partial: true)
+          assert err.message.starts_with?("In ")
+          assert err.message.ends_with?("BarValue was expected.")
+          nil
+        end.or_panic
+      end.or_panic
+    end
+
+    with_witness do |w|
+      IyiDb::Db.open("bar://host") do |db|
+        BarDriver.fake_row = [1] of BarAny
+        db.query "query" do |rs|
+          rs.move_next.or_panic
+          w.check
+          err = expect_error(rs.read(FooValue), ColumnTypeMismatchError, "BarDriver::BarResultSet#read the column 0 returned a Int32 but a ", partial: true)
+          assert err.message.starts_with?("In ")
+          assert err.message.ends_with?("FooValue was expected.")
+          nil
+        end.or_panic
+      end.or_panic
+    end
+  end
+
+  it "allow custom types to be used as arguments for query" do
+    IyiDb::Db.open("foo://host") do |db|
+      FooDriver.fake_row = [1, "string"] of FooAny
+      db.query("query") { }.or_panic
+      db.query("query", 1) { }.or_panic
+      db.query("query", 1, "string") { }.or_panic
+      db.query("query", Bytes.new(4)) { }.or_panic
+      db.query("query", 1, "string", FooValue.new(5)) { }.or_panic
+      db.query("query", args: [1, "string", FooValue.new(5)] of DBValue) { }.or_panic
+
+      db.query("query").or_panic.close
+      db.query("query", 1).or_panic.close
+      db.query("query", 1, "string").or_panic.close
+      db.query("query", Bytes.new(4)).or_panic.close
+      db.query("query", 1, "string", FooValue.new(5)).or_panic.close
+      db.query("query", args: [1, "string", FooValue.new(5)] of DBValue).or_panic.close
+    end.or_panic
+
+    IyiDb::Db.open("bar://host") do |db|
+      BarDriver.fake_row = [1, "string"] of BarAny
+      db.query("query") { }.or_panic
+      db.query("query", 1) { }.or_panic
+      db.query("query", 1, "string") { }.or_panic
+      db.query("query", Bytes.new(4)) { }.or_panic
+      db.query("query", 1, "string", BarValue.new(5)) { }.or_panic
+      db.query("query", args: [1, "string", BarValue.new(5)] of DBValue) { }.or_panic
+
+      db.query("query").or_panic.close
+      db.query("query", 1).or_panic.close
+      db.query("query", 1, "string").or_panic.close
+      db.query("query", Bytes.new(4)).or_panic.close
+      db.query("query", 1, "string", BarValue.new(5)).or_panic.close
+      db.query("query", args: [1, "string", BarValue.new(5)] of DBValue).or_panic.close
+    end.or_panic
+  end
+
+  it "allow custom types to be used as arguments for exec" do
+    IyiDb::Db.open("foo://host") do |db|
+      FooDriver.fake_row = [1, "string"] of FooAny
+      db.exec("query").or_panic
+      db.exec("query", 1).or_panic
+      db.exec("query", 1, "string").or_panic
+      db.exec("query", Bytes.new(4)).or_panic
+      db.exec("query", 1, "string", FooValue.new(5)).or_panic
+      db.exec("query", args: [1, "string", FooValue.new(5)] of DBValue).or_panic
+    end.or_panic
+
+    IyiDb::Db.open("bar://host") do |db|
+      BarDriver.fake_row = [1, "string"] of BarAny
+      db.exec("query").or_panic
+      db.exec("query", 1).or_panic
+      db.exec("query", 1, "string").or_panic
+      db.exec("query", Bytes.new(4)).or_panic
+      db.exec("query", 1, "string", BarValue.new(5)).or_panic
+      db.exec("query", args: [1, "string", BarValue.new(5)] of DBValue).or_panic
+    end.or_panic
+  end
+
+  # crystal raised from process_arg; here exec answers the error
+  it "Foo and Bar drivers should not implement each other params" do
+    IyiDb::Db.open("foo://host") do |db|
+      err = expect_error(db.exec("query", args: [BarValue.new(5)] of DBValue), DBError, "FooDriver::FooStatement does not support ", partial: true)
+      assert err.message.ends_with?("BarValue params")
+      nil
+    end.or_panic
+
+    IyiDb::Db.open("bar://host") do |db|
+      err = expect_error(db.exec("query", args: [FooValue.new(5)] of DBValue), DBError, "BarDriver::BarStatement does not support ", partial: true)
+      assert err.message.ends_with?("FooValue params")
+      nil
+    end.or_panic
+  end
+end

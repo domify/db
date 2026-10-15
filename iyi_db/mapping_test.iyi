@@ -1,0 +1,208 @@
+# crystal-db's spec/mapping_spec.cr.
+module iyi_db/mapping_test
+
+import std/base64::{Base64}
+import std/slice::{Bytes}
+import iyi_db/db
+import iyi_db/errors::*
+import iyi_db/core::*
+import iyi_db/serializable::{mapping}
+import iyi_db/spec::{describe, it, expect_error}
+import iyi_db/testing/dummy_driver::*
+
+# crystal's `String#to_slice`, which iyi's prelude has not.
+def bytes_of(text : String) : Bytes
+  Bytes.new(text.to_unsafe, text.bytesize).dup
+end
+
+class SimpleMapping
+  mapping({
+    c0: Int32,
+    c1: String,
+  })
+end
+
+class NonStrictMapping
+  mapping({
+    c1: Int32,
+    c2: String,
+  }, strict: false)
+end
+
+class MappingWithDefaults
+  mapping({
+    c0: {type: Int32, default: 10},
+    c1: {type: String, default: "c"},
+  })
+end
+
+class MappingWithNilables
+  mapping({
+    c0: {type: Int32, nilable: true, default: 10},
+    c1: {type: String, nilable: true},
+  })
+end
+
+class MappingWithNilTypes
+  mapping({
+    c0: {type: Int32?, default: 10},
+    c1: String?,
+  })
+end
+
+class MappingWithNilUnionTypes
+  mapping({
+    c0: {type: Int32 | Nil, default: 10},
+    c1: Nil | String,
+  })
+end
+
+class MappingWithKeys
+  mapping({
+    foo: {type: Int32, key: "c0"},
+    bar: {type: String, key: "c1"},
+  })
+end
+
+class MappingWithConverter
+  module Base64Converter
+    def self.from_rs(rs : ResultSet) : Bytes | DBError
+      text = rs.read(String)
+      return text if text.is_a?(DBError)
+      bytes_of(Base64.decode(text))
+    end
+  end
+
+  # crystal's `Slice(UInt8)`: iyi's `Bytes` alias names the std slice type
+  mapping({
+    c0: {type: Bytes, converter: MappingWithConverter::Base64Converter},
+    c1: {type: String},
+  })
+end
+
+# crystal's `Type.new(rs)` raising becomes `from_db_row` answering the error.
+macro from_dummy(query, type)
+  %obj : {{ type }} | DBError | Nil = nil
+  with_dummy do |db|
+    rs = db.query({{ query }}).or_panic
+    rs.move_next.or_panic
+    %obj = {{ type }}.from_db_row(rs)
+    rs.close
+  end
+  %obj.as({{ type }} | DBError)
+end
+
+macro expect_mapping(query, t, values)
+  %obj = from_dummy({{ query }}, {{ t }}).or_panic
+  assert %obj.is_a?({{ t }})
+  {% for key, value in values %}
+    assert %obj.{{ key.id }} == {{ value }}
+  {% end %}
+end
+
+describe "mapping" do
+  it "should initialize a simple mapping" do
+    expect_mapping("1,a", SimpleMapping, {c0: 1, c1: "a"})
+  end
+
+  it "should fail to initialize a simple mapping if types do not match" do
+    # the read's own error is answered, not wrapped in a MappingError
+    expect_error(from_dummy("b,a", SimpleMapping), ArgumentError)
+  end
+
+  it "should fail to initialize a simple mapping if there is a missing column" do
+    expect_error(from_dummy("1", SimpleMapping), MappingError)
+  end
+
+  it "should fail to initialize a simple mapping if there is an unexpected column" do
+    expect_error(from_dummy("1,a,b", SimpleMapping), MappingError)
+  end
+
+  it "should initialize a non-strict mapping if there is an unexpected column" do
+    expect_mapping("1,2,a,b", NonStrictMapping, {c1: 2, c2: "a"})
+  end
+
+  it "should initialize a mapping with default values" do
+    expect_mapping("1,a", MappingWithDefaults, {c0: 1, c1: "a"})
+  end
+
+  it "should initialize a mapping using default values if columns are missing" do
+    expect_mapping("1", MappingWithDefaults, {c0: 1, c1: "c"})
+  end
+
+  it "should initialize a mapping using default values if values are nil and types are non nilable" do
+    expect_mapping("1,NULL", MappingWithDefaults, {c0: 1, c1: "c"})
+  end
+
+  it "should initialize a mapping with nilable set if columns are missing" do
+    expect_mapping("1", MappingWithNilables, {c0: 1, c1: nil})
+  end
+
+  it "should initialize a mapping with nilable set ignoring default value if NULL" do
+    expect_mapping("NULL,a", MappingWithNilables, {c0: nil, c1: "a"})
+  end
+
+  it "should initialize a mapping with nilable types if columns are missing" do
+    expect_mapping("1", MappingWithNilTypes, {c0: 1, c1: nil})
+    expect_mapping("1", MappingWithNilUnionTypes, {c0: 1, c1: nil})
+  end
+
+  it "should initialize a mapping with nilable types ignoring default value if NULL" do
+    expect_mapping("NULL,a", MappingWithNilTypes, {c0: nil, c1: "a"})
+    expect_mapping("NULL,a", MappingWithNilUnionTypes, {c0: nil, c1: "a"})
+  end
+
+  it "should initialize a mapping with different keys" do
+    expect_mapping("1,a", MappingWithKeys, {foo: 1, bar: "a"})
+  end
+
+  it "should initialize a mapping with a value converter" do
+    expect_mapping("Zm9v,a", MappingWithConverter, {c0: bytes_of("foo"), c1: "a"})
+  end
+
+  it "should initialize multiple instances from a single resultset" do
+    with_dummy do |db|
+      db.query("1,a 2,b") do |rs|
+        objs = SimpleMapping.from_rs(rs).or_panic
+        assert objs.size == 2
+        assert objs[0].c0 == 1
+        assert objs[0].c1 == "a"
+        assert objs[1].c0 == 2
+        assert objs[1].c1 == "b"
+      end.or_panic
+    end
+  end
+
+  it "Class.from_rs should close resultset" do
+    with_dummy do |db|
+      rs = db.query("1,a 2,b").or_panic
+      objs = SimpleMapping.from_rs(rs).or_panic
+      assert rs.closed?
+
+      assert objs.size == 2
+      assert objs[0].c0 == 1
+      assert objs[0].c1 == "a"
+      assert objs[1].c0 == 2
+      assert objs[1].c1 == "b"
+    end
+  end
+
+  it "should initialize from a query_one" do
+    with_dummy do |db|
+      obj = db.query_one("1,a", as: SimpleMapping).or_panic
+      assert obj.c0 == 1
+      assert obj.c1 == "a"
+    end
+  end
+
+  it "should initialize from a query_all" do
+    with_dummy do |db|
+      objs = db.query_all("1,a 2,b", as: SimpleMapping).or_panic
+      assert objs.size == 2
+      assert objs[0].c0 == 1
+      assert objs[0].c1 == "a"
+      assert objs[1].c0 == 2
+      assert objs[1].c1 == "b"
+    end
+  end
+end

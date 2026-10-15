@@ -1,0 +1,270 @@
+# crystal-db's spec/serializable_spec.cr.
+module iyi_db/serializable_test
+
+import std/base64::{Base64}
+import std/slice::{Bytes}
+import std/json::{JSON, serializable}
+import iyi_db/db
+import iyi_db/errors::*
+import iyi_db/core::*
+import iyi_db/serializable::{db_serializable, db_serializable_non_strict, DBField}
+import iyi_db/spec::{describe, it, expect_error}
+import iyi_db/testing/dummy_driver::*
+
+# crystal's `String#to_slice`, which iyi's prelude has not.
+def bytes_of(text : String) : Bytes
+  Bytes.new(text.to_unsafe, text.bytesize).dup
+end
+
+class SimpleModel
+  property c0 : Int32
+  property c1 : String
+
+  derive db_serializable
+end
+
+class NonStrictModel
+  property c1 : Int32
+  property c2 : String
+
+  derive db_serializable_non_strict
+end
+
+class ModelWithDefaults
+  property c0 : Int32 = 10
+  property c1 : String = "c"
+
+  derive db_serializable
+end
+
+class ModelWithNilables
+  property c0 : Int32? = 10
+  property c1 : String?
+
+  derive db_serializable
+end
+
+class ModelWithNilUnionTypes
+  property c0 : Int32 | Nil = 10
+  property c1 : String | Nil
+
+  derive db_serializable
+end
+
+class ModelWithKeys
+  @[DBField(key: "c0")]
+  property foo : Int32
+  @[DBField(key: "c1")]
+  property bar : String
+
+  derive db_serializable
+end
+
+class ModelWithConverter
+  module Base64Converter
+    def self.from_rs(rs : ResultSet) : Bytes | DBError
+      text = rs.read(String)
+      return text if text.is_a?(DBError)
+      bytes_of(Base64.decode(text))
+    end
+  end
+
+  @[DBField(converter: ModelWithConverter::Base64Converter)]
+  # crystal's `Slice(UInt8)`: iyi's `Bytes` alias names the std slice type
+  property c0 : Bytes
+  property c1 : String
+
+  derive db_serializable
+end
+
+class ModelWithInitialize
+  property c0 : Int32
+  property c1 : String
+
+  # crystal's `def_equals c0, c1`
+  def ==(other : ModelWithInitialize) : Bool
+    c0 == other.c0 && c1 == other.c1
+  end
+
+  def initialize(@c0, @c1)
+  end
+
+  derive db_serializable
+end
+
+class ModelWithJSON
+  property c0 : Int32
+  property c1 : String
+
+  derive serializable, db_serializable
+end
+
+struct ModelWithEnum
+  getter c0 : Int32
+  getter c1 : MyEnum
+  # Ensure multiple enum types work together
+  getter c2 : MyOtherEnum
+
+  enum MyEnum
+    Foo  = 0
+    Bar  = 1
+    Baz  = 2
+    Quux = 3
+  end
+
+  enum MyOtherEnum
+    OMG
+    LOL
+    WTF
+    BBQ
+  end
+
+  derive db_serializable
+end
+
+# crystal's `Type.new(rs)` raising becomes `from_db_row` answering the error.
+macro from_dummy(query, type)
+  %obj : {{ type }} | DBError | Nil = nil
+  with_dummy do |db|
+    rs = db.query({{ query }}).or_panic
+    rs.move_next.or_panic
+    %obj = {{ type }}.from_db_row(rs)
+    rs.close
+  end
+  %obj.as({{ type }} | DBError)
+end
+
+macro expect_model(query, t, values)
+  %obj = from_dummy({{ query }}, {{ t }}).or_panic
+  assert %obj.is_a?({{ t }})
+  {% for key, value in values %}
+    assert %obj.{{ key.id }} == {{ value }}
+  {% end %}
+end
+
+describe "IyiDb::Serializable" do
+  it "should initialize a simple model" do
+    expect_model("1,a", SimpleModel, {c0: 1, c1: "a"})
+  end
+
+  it "should fail to initialize a simple model if types do not match" do
+    err = expect_error(from_dummy("b,a", SimpleModel), MappingError, %(Invalid Int32: "b"\n  deserializing ), partial: true)
+    assert err.message.ends_with?("SimpleModel#c0")
+  end
+
+  it "should fail to initialize a simple model if there is a missing column" do
+    err = expect_error(from_dummy("1", SimpleModel), MappingError, "Missing column c1\n  deserializing ", partial: true)
+    assert err.message.ends_with?("SimpleModel#c1")
+  end
+
+  it "should fail to initialize a simple model if there is an unexpected column" do
+    err = expect_error(from_dummy("1,a,b", SimpleModel), MappingError, "Unknown column: c2\n  deserializing ", partial: true)
+    assert err.message.ends_with?("SimpleModel")
+  end
+
+  it "should initialize a non-strict model if there is an unexpected column" do
+    expect_model("1,2,a,b", NonStrictModel, {c1: 2, c2: "a"})
+  end
+
+  it "should initialize a model with default values" do
+    expect_model("1,a", ModelWithDefaults, {c0: 1, c1: "a"})
+  end
+
+  it "should initialize a model using default values if columns are missing" do
+    expect_model("1", ModelWithDefaults, {c0: 1, c1: "c"})
+  end
+
+  it "should initialize a model using default values if values are nil and types are non nilable" do
+    expect_model("1,NULL", ModelWithDefaults, {c0: 1, c1: "c"})
+  end
+
+  it "should initialize a model with nilables if columns are missing" do
+    expect_model("1", ModelWithNilables, {c0: 1, c1: nil})
+  end
+
+  it "should initialize a model with nilables ignoring default value if NULL" do
+    expect_model("NULL,a", ModelWithNilables, {c0: nil, c1: "a"})
+  end
+
+  it "should initialize a model with nil union types if columns are missing" do
+    expect_model("1", ModelWithNilUnionTypes, {c0: 1, c1: nil})
+  end
+
+  it "should initialize a model with nil union types ignoring default value if NULL" do
+    expect_model("NULL,a", ModelWithNilUnionTypes, {c0: nil, c1: "a"})
+  end
+
+  it "should initialize a model with different keys" do
+    expect_model("1,a", ModelWithKeys, {foo: 1, bar: "a"})
+  end
+
+  it "should initialize a model with a value converter" do
+    expect_model("Zm9v,a", ModelWithConverter, {c0: bytes_of("foo"), c1: "a"})
+  end
+
+  it "should initialize a model with an initialize" do
+    obj1 = from_dummy("1,a", ModelWithInitialize).or_panic
+    obj2 = ModelWithInitialize.new(1, "a")
+    assert obj1 == obj2
+  end
+
+  it "should initialize a model with JSON serialization also defined" do
+    expect_model("1,a", ModelWithJSON, {c0: 1, c1: "a"})
+  end
+
+  it "should initialize a model with an enum property" do
+    expect_model("1,2,LOL", ModelWithEnum, {
+      c0: 1,
+      c1: ModelWithEnum::MyEnum::Baz,
+      c2: ModelWithEnum::MyOtherEnum::LOL,
+    })
+    err = expect_error(from_dummy("1,adsf,BBQ", ModelWithEnum), MappingError, "Unknown enum ", partial: true)
+    assert err.message.includes?("ModelWithEnum::MyEnum value: adsf\n  deserializing ")
+  end
+
+  it "should initialize multiple instances from a single resultset" do
+    with_dummy do |db|
+      db.query("1,a 2,b") do |rs|
+        objs = SimpleModel.from_rs(rs).or_panic
+        assert objs.size == 2
+        assert objs[0].c0 == 1
+        assert objs[0].c1 == "a"
+        assert objs[1].c0 == 2
+        assert objs[1].c1 == "b"
+      end.or_panic
+    end
+  end
+
+  it "Class.from_rs should close resultset" do
+    with_dummy do |db|
+      rs = db.query("1,a 2,b").or_panic
+      objs = SimpleModel.from_rs(rs).or_panic
+      assert rs.closed?
+
+      assert objs.size == 2
+      assert objs[0].c0 == 1
+      assert objs[0].c1 == "a"
+      assert objs[1].c0 == 2
+      assert objs[1].c1 == "b"
+    end
+  end
+
+  it "should initialize from a query_one" do
+    with_dummy do |db|
+      obj = db.query_one("1,a", as: SimpleModel).or_panic
+      assert obj.c0 == 1
+      assert obj.c1 == "a"
+    end
+  end
+
+  it "should initialize from a query_all" do
+    with_dummy do |db|
+      objs = db.query_all("1,a 2,b", as: SimpleModel).or_panic
+      assert objs.size == 2
+      assert objs[0].c0 == 1
+      assert objs[0].c1 == "a"
+      assert objs[1].c0 == 2
+      assert objs[1].c1 == "b"
+    end
+  end
+end
