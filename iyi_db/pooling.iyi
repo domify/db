@@ -1,0 +1,297 @@
+# A pool of reusable resources: database connections, or anything else with
+# a `close` (crystal-db's spec pools HTTP clients).
+#
+# The resource type is duck-typed as it is in crystal-db: `close` is
+# required; `closed?`, `before_checkout` and `after_release` are called when
+# the resource has them.
+#
+# crystal-db guards the pool with a `Mutex` for multi-threaded runtimes. iyi's
+# tasks share their group's thread and interleave only where one parks
+# (SPEC.md III.4.5), so the bookkeeping between two parks is already atomic and
+# the pool holds no lock. `@inflight` keeps counting the resources being built
+# while their builder is parked, as it does in crystal-db.
+module iyi_db/pooling
+
+import std/uri::{Params}
+import std/annotations::{Deprecated}
+import iyi_db/errors::*
+import iyi_db/query_params::*
+
+pub class Pool(T)
+  # How a pool is sized and how long it waits. Written out rather than with
+  # `record`, whose struct is not `pub` and so not part of an artifact.
+  pub struct Options
+    # initial number of resources in the pool
+    getter initial_pool_size : Int32
+    # maximum amount of resources in the pool (idle + in use). 0 means no maximum.
+    getter max_pool_size : Int32
+    # maximum amount of idle resources in the pool
+    getter max_idle_pool_size : Int32
+    # seconds to wait before timeout while doing a checkout
+    getter checkout_timeout : Float64
+    # maximum amount of retry attempts to reconnect to the db. See `Pool#retry`
+    getter retry_attempts : Int32
+    # seconds to wait before a retry attempt
+    getter retry_delay : Float64
+
+    def initialize(@initial_pool_size : Int32 = 1, @max_pool_size : Int32 = 0, @max_idle_pool_size : Int32 = 1,
+                   @checkout_timeout : Float64 = 5.0, @retry_attempts : Int32 = 1, @retry_delay : Float64 = 0.2)
+    end
+
+    # The options a connection URI's query string sets, *default* for the
+    # ones it does not.
+    def self.from_http_params(params : Params, default : Options = Options.new) : Options | DBError
+      initial_pool_size = fetch_int(params, "initial_pool_size", default.initial_pool_size)!
+      max_pool_size = fetch_int(params, "max_pool_size", default.max_pool_size)!
+      max_idle_pool_size = fetch_int(params, "max_idle_pool_size", default.max_idle_pool_size)!
+      checkout_timeout = fetch_float(params, "checkout_timeout", default.checkout_timeout)!
+      retry_attempts = fetch_int(params, "retry_attempts", default.retry_attempts)!
+      retry_delay = fetch_float(params, "retry_delay", default.retry_delay)!
+      Options.new(
+        initial_pool_size: initial_pool_size,
+        max_pool_size: max_pool_size,
+        max_idle_pool_size: max_idle_pool_size,
+        checkout_timeout: checkout_timeout,
+        retry_attempts: retry_attempts,
+        retry_delay: retry_delay,
+      )
+    end
+  end
+
+  # What a pool holds right now.
+  pub struct Stats
+    getter open_connections : Int32
+    getter idle_connections : Int32
+    getter in_flight_connections : Int32
+    getter max_connections : Int32
+
+    def initialize(@open_connections : Int32, @idle_connections : Int32, @in_flight_connections : Int32, @max_connections : Int32)
+    end
+  end
+
+  # Pool configuration
+
+  # initial number of resources in the pool
+  @initial_pool_size : Int32
+  # maximum amount of resources in the pool (idle + in use)
+  @max_pool_size : Int32
+  # maximum amount of idle resources in the pool
+  @max_idle_pool_size : Int32
+  # seconds to wait before timeout while doing a checkout
+  @checkout_timeout : Float64
+  # maximum amount of retry attempts to reconnect to the db. See `Pool#retry`
+  @retry_attempts : Int32
+  # seconds to wait before a retry attempt
+  @retry_delay : Float64
+
+  # Pool state
+
+  # every open resource managed by this pool
+  @total : Array(T)
+  # resources available for checkout
+  @idle : Set(T)
+  # resources being built (in neither *@idle* nor *@total* yet)
+  @inflight : Int32
+
+  # tells a waiting checkout that a resource was released
+  @availability_channel : Channel(Nil)
+
+  @factory : Proc(T | DBError)
+
+  # Builds the pool without opening anything: `prefill` opens the
+  # `initial_pool_size` resources, and a checkout opens one when none is idle.
+  # Crystal's constructor opened them itself; here opening can fail, and a
+  # constructor has no error to answer.
+  def initialize(pool_options : Options = Options.new, &factory : -> T | DBError)
+    @initial_pool_size = pool_options.initial_pool_size
+    @max_pool_size = pool_options.max_pool_size
+    @max_idle_pool_size = pool_options.max_idle_pool_size
+    @checkout_timeout = pool_options.checkout_timeout
+    @retry_attempts = pool_options.retry_attempts
+    @retry_delay = pool_options.retry_delay
+
+    @total = [] of T
+    @idle = Set(T).new
+    @inflight = 0
+    @availability_channel = Channel(Nil).new
+    @factory = -> { factory.call.as(T | DBError) }
+  end
+
+  @[Deprecated("Use `#new` with Pool::Options instead")]
+  def initialize(initial_pool_size : Int32 = 1, max_pool_size : Int32 = 0, max_idle_pool_size : Int32 = 1, checkout_timeout : Float64 = 5.0,
+                 retry_attempts : Int32 = 1, retry_delay : Float64 = 0.2, &factory : -> T | DBError)
+    initialize(
+      Options.new(
+        initial_pool_size: initial_pool_size, max_pool_size: max_pool_size,
+        max_idle_pool_size: max_idle_pool_size, checkout_timeout: checkout_timeout,
+        retry_attempts: retry_attempts, retry_delay: retry_delay),
+      &factory)
+  end
+
+  # Opens resources until `initial_pool_size` of them are open. The first
+  # resource the factory cannot build is answered and the rest are not
+  # attempted.
+  def prefill : Nil | DBError
+    while @total.size < @initial_pool_size
+      build_resource!
+    end
+    nil
+  end
+
+  # Closes every resource of the pool.
+  def close : Nil
+    @total.each &.close
+    @total = [] of T
+    @idle = Set(T).new
+  end
+
+  def stats : Stats
+    Stats.new(
+      open_connections: @total.size,
+      idle_connections: @idle.size,
+      in_flight_connections: @inflight,
+      max_connections: @max_pool_size,
+    )
+  end
+
+  # An idle resource, a new one when the pool may grow, or one released
+  # within `checkout_timeout`; `PoolTimeout` when none came.
+  def checkout : T | DBError
+    resource = nil
+    until resource
+      if @idle.empty?
+        if can_increase_pool?
+          @inflight += 1
+          built = build_resource
+          @inflight -= 1
+          return built if built.is_a?(DBError)
+          resource = built
+        else
+          wait_for_available!
+          # The wait can wake several checkouts for one released resource.
+          # Only one of them finds it; the others go round again.
+          resource = pick_available
+        end
+      else
+        resource = pick_available
+      end
+    end
+
+    @idle.delete resource
+    if resource.responds_to?(:before_checkout)
+      resource.before_checkout
+    end
+    resource
+  end
+
+  # Yields a checked-out resource and releases it when the block is left.
+  def checkout(& : T -> U) : U | DBError forall U
+    resource = checkout!
+    defer release resource
+    yield resource
+  end
+
+  def release(resource : T) : Nil
+    idle_pushed = false
+
+    if resource.responds_to?(:closed?) && resource.closed?
+      @total.delete(resource)
+    elsif can_increase_idle_pool
+      @idle.add resource
+      if resource.responds_to?(:after_release)
+        resource.after_release
+      end
+      idle_pushed = true
+    else
+      resource.close
+      @total.delete(resource)
+    end
+
+    if idle_pushed
+      select
+      when @availability_channel.send(nil)
+      else
+      end
+    end
+  end
+
+  # Runs the block again while it answers a lost or refused resource. Every
+  # idle resource is tried right away (and one new one, if the pool may
+  # grow); after those, each attempt waits `retry_delay` seconds first.
+  # `PoolRetryAttemptsExceeded` once `retry_attempts` more are spent.
+  def retry(& : -> U) : U | DBError forall U
+    current_available = @idle.size
+    # if the pool hasn't reached the max size, allow 1 attempt
+    # to make a new resource if needed without sleeping
+    current_available += 1 if can_increase_pool?
+
+    (current_available + @retry_attempts).times do |i|
+      if i >= current_available
+        if sleep(seconds_to_ms(@retry_delay)).is_a?(Cancelled)
+          return PoolRetryAttemptsExceeded.new("retry cancelled")
+        end
+      end
+      result = yield
+      case result
+      when PoolResourceLost(T)
+        # the error closed the resource; it still has to leave the pool
+        delete(result.resource)
+      when PoolResourceRefused
+        # a new resource was being created: nothing to do but try again
+      else
+        return result
+      end
+    end
+    PoolRetryAttemptsExceeded.new
+  end
+
+  # Yields every idle resource.
+  def each_resource(& : T -> Nil) : Nil
+    @idle.each { |resource| yield resource }
+  end
+
+  def is_available?(resource : T) : Bool
+    @idle.includes?(resource)
+  end
+
+  def delete(resource : T) : Nil
+    @total.delete(resource)
+    @idle.delete(resource)
+  end
+
+  private def build_resource : T | DBError
+    resource = @factory.call
+    return resource if resource.is_a?(DBError)
+    @total << resource
+    @idle.add resource
+    resource
+  end
+
+  private def can_increase_pool? : Bool
+    @max_pool_size == 0 || @total.size + @inflight < @max_pool_size
+  end
+
+  private def can_increase_idle_pool : Bool
+    @idle.size < @max_idle_pool_size
+  end
+
+  private def pick_available : T?
+    @idle.each { |resource| return resource }
+    nil
+  end
+
+  private def wait_for_available : Nil | DBError
+    available = false
+    select
+    when @availability_channel.receive
+      available = true
+    when timeout(seconds_to_ms(@checkout_timeout))
+    end
+    return nil if available
+    PoolTimeout.new("Could not check out a connection in #{@checkout_timeout} seconds")
+  end
+
+  private def seconds_to_ms(seconds : Float64) : Int32
+    (seconds * 1000).to_i32
+  end
+end
