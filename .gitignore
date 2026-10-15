@@ -1,0 +1,9 @@
+# Build products
+*.iyimod
+/mods/
+*.exe
+*.pdb
+
+# Local binaries
+/bin/
+/tmp/
