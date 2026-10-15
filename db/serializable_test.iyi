@@ -1,15 +1,15 @@
 # crystal-db's spec/serializable_spec.cr.
-module iyi_db/serializable_test
+module db/serializable_test
 
 import std/base64::{Base64}
 import std/slice::{Bytes}
 import std/json::{JSON, serializable}
-import iyi_db/db
-import iyi_db/errors::*
-import iyi_db/core::*
-import iyi_db/serializable::{db_serializable, db_serializable_non_strict, DBField}
-import iyi_db/spec::{describe, it, expect_error}
-import iyi_db/testing/dummy_driver::*
+import db/db
+import db/errors::*
+import db/core::*
+import db/serializable::{db_serializable, db_serializable_non_strict, DBField}
+import db/spec::{describe, it, expect_error}
+import db/testing/dummy_driver::*
 
 # crystal's `String#to_slice`, which iyi's prelude has not.
 def bytes_of(text : String) : Bytes
@@ -142,7 +142,7 @@ macro expect_model(query, t, values)
   {% end %}
 end
 
-describe "IyiDb::Serializable" do
+describe "Db::Serializable" do
   it "should initialize a simple model" do
     expect_model("1,a", SimpleModel, {c0: 1, c1: "a"})
   end

@@ -1,4 +1,4 @@
-# The entry point: `IyiDb::Db.open`, `IyiDb::Db.connect` and the driver
+# The entry point: `Db::Db.open`, `Db::Db.connect` and the driver
 # registry, crystal-db's `DB` module. iyi-db is the common database interface
 # for iyi, ported from crystal-db (https://github.com/crystal-lang/crystal-db);
 # a driver for a specific database is needed to access one.
@@ -12,16 +12,16 @@
 # ### Usage
 #
 # ```
-# import db/iyi_db/db
+# import db/db/db
 #
-# db = IyiDb::Db.open("sqlite3:./path/to/db/file.db")!
+# db = Db::Db.open("sqlite3:./path/to/db/file.db")!
 # db.close
 # ```
 #
 # With a block the database is closed when the block is left:
 #
 # ```
-# IyiDb::Db.open("sqlite3:./file.db") do |db|
+# Db::Db.open("sqlite3:./file.db") do |db|
 #   # work with db
 # end
 # ```
@@ -38,13 +38,13 @@
 # PostgreSQL writes `$1`, `$2`, ...
 #
 # ```
-# import db/iyi_db/db
-# import db/iyi_db/value::{DBValue}
-# import db/iyi_db/errors::{DBError}
+# import db/db/db
+# import db/db/value::{DBValue}
+# import db/db/errors::{DBError}
 # import sqlite3/sqlite3 # a driver
 #
 # def contacts : Nil | DBError
-#   IyiDb::Db.open("sqlite3:./file.db") do |db|
+#   Db::Db.open("sqlite3:./file.db") do |db|
 #     db.exec("create table contacts (name text, age integer)")!
 #     db.exec("insert into contacts values (?, ?)", "John Doe", 30)!
 #
@@ -72,21 +72,21 @@
 #
 # ### Object mapping
 #
-# `derive db_serializable` (module `iyi_db/serializable`) maps the rows of a
+# `derive db_serializable` (module `db/serializable`) maps the rows of a
 # result set to a struct or class.
-module iyi_db/db
+module db/db
 
-# The types live in `iyi_db/core`, `iyi_db/errors`, `iyi_db/value`,
-# `iyi_db/pooling` and `iyi_db/serializable`; a program imports the ones it
-# names. There is no `iyi_db` module above them: in iyi 0.17.0 an artifact of
-# a module holds the modules under its path again, so a program built from
-# artifacts would have every type twice.
+# The types live in `db/core`, `db/errors`, `db/value`, `db/pooling` and
+# `db/serializable`; a program imports the ones it names. There is no `db`
+# module above them, which would make this `Db.open`: in iyi 0.17.0 an
+# artifact of a module holds the modules under its path again, so a program
+# built from artifacts would have every type twice (iyilang/iyi#124).
 
 import std/uri::{URI, Params}
-import iyi_db/errors::*
-import iyi_db/core::*
+import db/errors::*
+import db/core::*
 
-pub VERSION = "0.1.0"
+pub VERSION = "0.1.1"
 
 DRIVERS = {} of String => Driver.class
 

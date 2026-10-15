@@ -6,8 +6,8 @@ module manual/pool_concurrency
 
 import std/option_parser::{OptionParser}
 import std/time::{Time}
-import iyi_db/db
-import iyi_db/testing/dummy_driver::*
+import db/db
+import db/testing/dummy_driver::*
 
 options = ""
 duration = 3
@@ -46,7 +46,7 @@ if !release
   puts "WARNING: This should be run in release mode."
 end
 
-db = IyiDb::Db.open("dummy://host?#{options}").or_panic
+db = ::Db::Db.open("dummy://host?#{options}").or_panic
 
 start_time = Time.monotonic
 

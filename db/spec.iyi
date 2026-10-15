@@ -5,18 +5,18 @@
 # passes when it exits 0. `describe`, `context` and `it` name the examples;
 # `assert` (the prelude's) and `expect_error` check them. An example that
 # panics is reported by its full name and ends the program with status 1.
-module iyi_db/spec
+module db/spec
 
-pub import iyi_db/errors
-pub import iyi_db/value
-pub import iyi_db/core
+pub import db/errors
+pub import db/value
+pub import db/core
 
 import std/uri::{URI, Params}
 import std/text
-import iyi_db/db
-import iyi_db/errors::*
-import iyi_db/value::*
-import iyi_db/core::*
+import db/db
+import db/errors::*
+import db/value::*
+import db/core::*
 
 class Nesting
   @path : String
@@ -103,7 +103,7 @@ end
 # Helper class to ensure behaviour of custom drivers.
 #
 # ```
-# import db/iyi_db/spec::{DriverSpecs}
+# import db/db/spec::{DriverSpecs}
 #
 # DriverSpecs.run do |specs|
 #   # How to connect to database
@@ -445,7 +445,7 @@ pub class DriverSpecs
     end
 
     it "can create direct connection" do
-      IyiDb::Db.connect(connection_string) do |cnn|
+      ::Db::Db.connect(connection_string) do |cnn|
         assert cnn.is_a?(Connection)
         assert ok(cnn.scalar(select_scalar(encode_null, nil))).nil?
       end.or_panic
@@ -610,7 +610,7 @@ pub class DriverSpecs
       connection_string_with_options = uri.to_s
     end
 
-    IyiDb::Db.open(connection_string_with_options) do |db|
+    ::Db::Db.open(connection_string_with_options) do |db|
       db.exec(sql_drop_table("table1")).or_panic
       db.exec(sql_drop_table("table2")).or_panic
       db.exec(sql_drop_table("person")).or_panic
@@ -712,7 +712,7 @@ pub class DriverSpecs
       ctx.its.each do |db_it|
         case db_it.prepared
         when :default
-          ::IyiDb::Spec.it(db_it.description) do
+          ::Db::Spec.it(db_it.description) do
             ctx.with_db { |db| db_it.block.call(db) }
           end
         when :both
@@ -723,12 +723,12 @@ pub class DriverSpecs
           when 0
             raise "Neither prepared non unprepared statements allowed"
           when 1
-            ::IyiDb::Spec.it(db_it.description) do
+            ::Db::Spec.it(db_it.description) do
               ctx.with_db { |db| db_it.block.call(db) }
             end
           else
             values.each do |prepared_statements|
-              ::IyiDb::Spec.it("#{db_it.description} (prepared_statements=#{prepared_statements})") do
+              ::Db::Spec.it("#{db_it.description} (prepared_statements=#{prepared_statements})") do
                 ctx.with_db("prepared_statements=#{prepared_statements}") { |db| db_it.block.call(db) }
               end
             end

@@ -1,11 +1,11 @@
 # crystal-db's spec/transaction_spec.cr.
-module iyi_db/transaction_test
+module db/transaction_test
 
-import iyi_db/db
-import iyi_db/errors::*
-import iyi_db/core::*
-import iyi_db/spec::{describe, it, expect_error}
-import iyi_db/testing/dummy_driver::*
+import db/db
+import db/errors::*
+import db/core::*
+import db/spec::{describe, it, expect_error}
+import db/testing/dummy_driver::*
 
 # crystal's FooException: errors are values in iyi.
 class FooError < DBError

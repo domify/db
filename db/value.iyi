@@ -11,7 +11,7 @@
 # import this one, which an artifact of this module cannot name (R-1); and
 # an array is a database value for every element type, which only a generic
 # impl could say, making every array anywhere in a program one.
-module iyi_db/value
+module db/value
 
 # `DBValue` names `Time`, `Span` and `Bytes`, so a module that names
 # `DBValue` reaches their modules through this one.

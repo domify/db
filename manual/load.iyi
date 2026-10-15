@@ -8,9 +8,9 @@
 module manual/load
 
 import std/text
-import iyi_db/db
-import iyi_db/errors::{DBError}
-import iyi_db/testing/dummy_driver::*
+import db/db
+import db/errors::{DBError}
+import db/testing/dummy_driver::*
 
 CONNECTION = "dummy://host?initial_pool_size=5&max_pool_size=5&max_idle_pool_size=5"
 
@@ -34,7 +34,7 @@ end
 # crystal's block-form `DB.open` returned while the producers still ran;
 # here the producers' group keeps the database open until they are done.
 def start_producers(channel : TChannel)
-  IyiDb::Db.open CONNECTION do |db|
+  ::Db::Db.open CONNECTION do |db|
     sql = "1,title,description,2023 " * 100_000
 
     group do |g|

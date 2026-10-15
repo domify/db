@@ -1,13 +1,13 @@
 # crystal-db's spec/dummy_driver_spec.cr.
-module iyi_db/dummy_driver_test
+module db/dummy_driver_test
 
 import std/slice::{Slice, Bytes}
-import iyi_db/db
-import iyi_db/errors::*
-import iyi_db/value::*
-import iyi_db/core::*
-import iyi_db/spec::{describe, it, expect_error}
-import iyi_db/testing/dummy_driver::*
+import db/db
+import db/errors::*
+import db/value::*
+import db/core::*
+import db/spec::{describe, it, expect_error}
+import db/testing/dummy_driver::*
 
 describe "DummyDriver" do
   it "with_dummy executes the block with a database" do

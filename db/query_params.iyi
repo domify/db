@@ -2,11 +2,11 @@
 #
 # A malformed option is an `ArgumentError` the caller sees, where Crystal's
 # `String#to_i` raised.
-module iyi_db/query_params
+module db/query_params
 
 import std/uri::{Params}
 import std/text
-import iyi_db/errors::*
+import db/errors::*
 
 # The boolean option *name*: `true` or `false` in any case, *default* when it
 # is absent. crystal-db's `DB.fetch_bool`.

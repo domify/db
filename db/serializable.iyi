@@ -5,7 +5,7 @@
 # type (SPEC.md II.4):
 #
 # ```
-# import db/iyi_db/serializable::{db_serializable, DBField}
+# import db/db/serializable::{db_serializable, DBField}
 #
 # class Employee
 #   property title : String
@@ -42,10 +42,10 @@
 # * **key**: the column to read (the instance variable's name by default)
 # * **converter**: a type whose `from_rs(rs : ResultSet)` reads the value,
 #   answering it or a `DBError`
-module iyi_db/serializable
+module db/serializable
 
-pub import iyi_db/errors
-pub import iyi_db/core
+pub import db/errors
+pub import db/core
 
 # Sets how one instance variable is read. See the module's documentation.
 pub annotation DBField
@@ -54,14 +54,14 @@ end
 # Reads the type from result sets, and refuses a column it has no property
 # for. Crystal's `include DB::Serializable`.
 pub macro db_serializable(declaration)
-  ::IyiDb::Serializable.db_serializable_with({{ declaration }}, true)
+  ::Db::Serializable.db_serializable_with({{ declaration }}, true)
 end
 
 # Reads the type from result sets, passing over a column it has no property
 # for. Crystal's `include DB::Serializable` with
 # `include DB::Serializable::NonStrict`.
 pub macro db_serializable_non_strict(declaration)
-  ::IyiDb::Serializable.db_serializable_with({{ declaration }}, false)
+  ::Db::Serializable.db_serializable_with({{ declaration }}, false)
 end
 
 # What both derives write: *strict* says whether an unknown column is an
@@ -74,41 +74,41 @@ pub macro db_serializable_with(declaration, strict)
   # macro would be reached the way another module reaches it, R-2), and the
   # instance is then built from the values by an `initialize` that assigns
   # every field, as the compiler requires.
-  def self.from_db_row(rs : ::IyiDb::Core::ResultSet) : self | ::IyiDb::Errors::DBError
+  def self.from_db_row(rs : ::Db::Core::ResultSet) : self | ::Db::Errors::DBError
     values = allocate.__iyi_db_read_values(rs)
-    return values if values.is_a?(::IyiDb::Errors::DBError)
+    return values if values.is_a?(::Db::Errors::DBError)
     new(__iyi_db_values: values)
   end
 
   # Reads every row of *rs*, and closes it.
-  def self.from_rs(rs : ::IyiDb::Core::ResultSet) : Array(self) | ::IyiDb::Errors::DBError
+  def self.from_rs(rs : ::Db::Core::ResultSet) : Array(self) | ::Db::Errors::DBError
     defer rs.close
     objects = [] of self
     # A macro body cannot hold `end!`: its scanner counts `end` to find
     # where the macro stops.
     iterated = rs.each do
       object = from_db_row(rs)
-      return object if object.is_a?(::IyiDb::Errors::DBError)
+      return object if object.is_a?(::Db::Errors::DBError)
       objects << object
     end
-    return iterated if iterated.is_a?(::IyiDb::Errors::DBError)
+    return iterated if iterated.is_a?(::Db::Errors::DBError)
     objects
   end
 
   def initialize(*, __iyi_db_values values : V) forall V
     \{% for ivar in @type.instance_vars %}
-      \{% ann = ivar.annotation(::IyiDb::Serializable::DBField) %}
+      \{% ann = ivar.annotation(::Db::Serializable::DBField) %}
       \{% unless ann && ann[:ignore] %}
         @\{{ ivar.id }} = values[:\{{ ivar.id }}]
       \{% end %}
     \{% end %}
   end
 
-  protected def __iyi_db_read_values(rs : ::IyiDb::Core::ResultSet)
+  protected def __iyi_db_read_values(rs : ::Db::Core::ResultSet)
     \{% begin %}
       \{% properties = {} of Nil => Nil %}
       \{% for ivar in @type.instance_vars %}
-        \{% ann = ivar.annotation(::IyiDb::Serializable::DBField) %}
+        \{% ann = ivar.annotation(::Db::Serializable::DBField) %}
         \{% unless ann && ann[:ignore] %}
           \{% properties[ivar.id] = {key: ((ann && ann[:key]) || ivar).id.stringify, default: ivar.default_value, has_default: ivar.has_default_value?, nilable: ivar.type.nilable?, converter: ann && ann[:converter]} %}
         \{% end %}
@@ -132,25 +132,25 @@ pub macro db_serializable_with(declaration, strict)
           \{% else %}
             __iyi_db_read_\{{ name }} = rs.read(typeof(@\{{ name }}))
           \{% end %}
-          if __iyi_db_read_\{{ name }}.is_a?(::IyiDb::Errors::DBError)
-            return ::IyiDb::Errors::MappingError.new(__iyi_db_read_\{{ name }}.message, self.class.to_s, \{{ name.stringify }}, cause: __iyi_db_read_\{{ name }})
+          if __iyi_db_read_\{{ name }}.is_a?(::Db::Errors::DBError)
+            return ::Db::Errors::MappingError.new(__iyi_db_read_\{{ name }}.message, self.class.to_s, \{{ name.stringify }}, cause: __iyi_db_read_\{{ name }})
           end
           __iyi_db_value_\{{ name }} = __iyi_db_read_\{{ name }}
         \{% end %}
         else
           skipped = rs.read
-          return skipped if skipped.is_a?(::IyiDb::Errors::DBError)
+          return skipped if skipped.is_a?(::Db::Errors::DBError)
           {% if strict %}
-            return ::IyiDb::Errors::MappingError.new("Unknown column: #{col_name}", self.class.to_s)
+            return ::Db::Errors::MappingError.new("Unknown column: #{col_name}", self.class.to_s)
           {% end %}
         end
       end
       \{% else %}
       rs.each_column do |col_name|
         skipped = rs.read
-        return skipped if skipped.is_a?(::IyiDb::Errors::DBError)
+        return skipped if skipped.is_a?(::Db::Errors::DBError)
         {% if strict %}
-          return ::IyiDb::Errors::MappingError.new("Unknown column: #{col_name}", self.class.to_s)
+          return ::Db::Errors::MappingError.new("Unknown column: #{col_name}", self.class.to_s)
         {% end %}
       end
       \{% end %}
@@ -158,7 +158,7 @@ pub macro db_serializable_with(declaration, strict)
       \{% for name, value in properties %}
         \{% unless value[:nilable] || value[:has_default] %}
           if __iyi_db_value_\{{ name }}.nil? && !__iyi_db_found_\{{ name }}
-            return ::IyiDb::Errors::MappingError.new("Missing column " + \{{ value[:key] }}, self.class.to_s, \{{ name.stringify }})
+            return ::Db::Errors::MappingError.new("Missing column " + \{{ value[:key] }}, self.class.to_s, \{{ name.stringify }})
           end
         \{% end %}
       \{% end %}
@@ -249,15 +249,15 @@ pub macro mapping(properties, strict = true)
   {% end %}
 
   # Reads every row of *rs*, and closes it.
-  def self.from_rs(%rs : ::IyiDb::Core::ResultSet) : Array(self) | ::IyiDb::Errors::DBError
+  def self.from_rs(%rs : ::Db::Core::ResultSet) : Array(self) | ::Db::Errors::DBError
     defer %rs.close
     %objs = [] of self
     %iterated = %rs.each do
       %obj = from_db_row(%rs)
-      return %obj if %obj.is_a?(::IyiDb::Errors::DBError)
+      return %obj if %obj.is_a?(::Db::Errors::DBError)
       %objs << %obj
     end
-    return %iterated if %iterated.is_a?(::IyiDb::Errors::DBError)
+    return %iterated if %iterated.is_a?(::Db::Errors::DBError)
     %objs
   end
 
@@ -268,7 +268,7 @@ pub macro mapping(properties, strict = true)
   end
 
   # Reads the current row of *rs*.
-  def self.from_db_row(%rs : ::IyiDb::Core::ResultSet) : self | ::IyiDb::Errors::DBError
+  def self.from_db_row(%rs : ::Db::Core::ResultSet) : self | ::Db::Errors::DBError
     {% for key, value in properties %}
       %var{key.id} = nil
       %found{key.id} = false
@@ -287,14 +287,14 @@ pub macro mapping(properties, strict = true)
               {% else %}
                 %rs.read({{ value[:type] }})
               {% end %}
-            return %read{key.id} if %read{key.id}.is_a?(::IyiDb::Errors::DBError)
+            return %read{key.id} if %read{key.id}.is_a?(::Db::Errors::DBError)
             %var{key.id} = %read{key.id}
         {% end %}
       else
         %skipped = %rs.read
-        return %skipped if %skipped.is_a?(::IyiDb::Errors::DBError)
+        return %skipped if %skipped.is_a?(::Db::Errors::DBError)
         {% if strict %}
-          return ::IyiDb::Errors::MappingError.new("unknown result set attribute: #{col_name}", self.to_s)
+          return ::Db::Errors::MappingError.new("unknown result set attribute: #{col_name}", self.to_s)
         {% end %}
       end
     end
@@ -302,7 +302,7 @@ pub macro mapping(properties, strict = true)
     {% for key, value in properties %}
       {% unless value[:nilable] || value[:default] != nil %}
         if %var{key.id}.is_a?(Nil) && !%found{key.id}
-          return ::IyiDb::Errors::MappingError.new("missing result set attribute: {{ (value[:key] || key).id }}", self.to_s)
+          return ::Db::Errors::MappingError.new("missing result set attribute: {{ (value[:key] || key).id }}", self.to_s)
         end
       {% end %}
     {% end %}

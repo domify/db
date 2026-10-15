@@ -12,15 +12,15 @@
 # Integers are stored as `Int64` (as sqlite does), so the result set reads
 # an `Int32` from one. A transaction works on its connection's copy of the
 # tables, published on COMMIT; savepoints are snapshots of that copy.
-module iyi_db/driver_specs_test
+module db/driver_specs_test
 
 import std/uri::{URI, Params}
 import std/text
-import iyi_db/db
-import iyi_db/errors::*
-import iyi_db/value::*
-import iyi_db/core::*
-import iyi_db/spec::{DriverSpecs}
+import db/db
+import db/errors::*
+import db/value::*
+import db/core::*
+import db/spec::{DriverSpecs}
 
 class MemoryTable
   getter columns : Array(String)
@@ -448,7 +448,7 @@ class MemoryResultSet < ResultSet
   end
 end
 
-IyiDb::Db.register_driver "memory", MemoryDriver
+::Db::Db.register_driver "memory", MemoryDriver
 
 # The `prepared_statements` value of every run of the `:both` example below.
 PREPARED_RUNS = [] of Bool

@@ -6,7 +6,7 @@
 # crystal-db has, so `in PoolTimeout` still means what `rescue DB::PoolTimeout`
 # meant, and `in DBError` still catches all of them. A driver adds its own
 # kinds by subclassing `DBError`.
-module iyi_db/errors
+module db/errors
 
 # The root of every error this library and its drivers answer. Crystal's
 # `DB::Error`.

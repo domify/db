@@ -10,12 +10,12 @@
 # (SPEC.md III.4.5), so the bookkeeping between two parks is already atomic and
 # the pool holds no lock. `@inflight` keeps counting the resources being built
 # while their builder is parked, as it does in crystal-db.
-module iyi_db/pooling
+module db/pooling
 
 import std/uri::{Params}
 import std/annotations::{Deprecated}
-import iyi_db/errors::*
-import iyi_db/query_params::*
+import db/errors::*
+import db/query_params::*
 
 pub class Pool(T)
   # How a pool is sized and how long it waits. Written out rather than with

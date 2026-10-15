@@ -26,13 +26,13 @@ jobs:
       - run: iyi version
 
       - name: Test
-        run: iyi test iyi_db
+        run: iyi test db
 
       # Every test again, compiled from the .iyimod artifacts a first build
       # wrote, so the library keeps building module by module (R-1).
       - name: Test from artifacts
         run: |
-          for test in iyi_db/*_test.iyi; do
+          for test in db/*_test.iyi; do
             mods="$RUNNER_TEMP/mods/$(basename "$test" .iyi)"
             mkdir -p "$mods"
             iyi build --emit-iyimod "$mods" "$test" -o "$RUNNER_TEMP/emitted"
@@ -48,5 +48,5 @@ jobs:
           done
 
       - name: Check formatting
-        run: iyi fmt --check iyi_db manual
+        run: iyi fmt --check db manual
         if: matrix.os == 'ubuntu-24.04'

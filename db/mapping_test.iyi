@@ -1,14 +1,14 @@
 # crystal-db's spec/mapping_spec.cr.
-module iyi_db/mapping_test
+module db/mapping_test
 
 import std/base64::{Base64}
 import std/slice::{Bytes}
-import iyi_db/db
-import iyi_db/errors::*
-import iyi_db/core::*
-import iyi_db/serializable::{mapping}
-import iyi_db/spec::{describe, it, expect_error}
-import iyi_db/testing/dummy_driver::*
+import db/db
+import db/errors::*
+import db/core::*
+import db/serializable::{mapping}
+import db/spec::{describe, it, expect_error}
+import db/testing/dummy_driver::*
 
 # crystal's `String#to_slice`, which iyi's prelude has not.
 def bytes_of(text : String) : Bytes

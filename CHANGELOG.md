@@ -1,3 +1,15 @@
+## v0.1.1
+
+The modules move from `iyi_db/` to `db/`, so their namespace is `Db::...`
+when the package is required. A package's modules are named under the
+package's name, `db`, and v0.1.0's `iyi_db/core` became `Db::IyiDb::Core`
+in a program that required it: the names `derive db_serializable`,
+`mapping` and the README wrote (`::IyiDb::...`, `IyiDb::Db.open`) did not
+resolve there.
+
+* `IyiDb::Db.open` is `Db::Db.open`; `import db/iyi_db/core::*` is
+  `import db/db/core::*`.
+
 ## v0.1.0
 
 The first release of iyi-db: crystal-db 0.15.0 ported to iyi, in iyi, with no

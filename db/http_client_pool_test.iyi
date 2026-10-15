@@ -6,15 +6,15 @@
 # (`GET /?delay=0.1`) on each accepted connection, sleeps the requested delay
 # and answers `ok`, counting the requests per connection; `HttpClient` wraps
 # one persistent connection and is pooled as crystal pooled `HTTP::Client`.
-module iyi_db/http_client_pool_test
+module db/http_client_pool_test
 
 import std/socket::{IyiSocket}
 import std/time::{Time, Span}
-import iyi_db/pooling::{Pool}
-import iyi_db/spec::{describe, it}
+import db/pooling::{Pool}
+import db/spec::{describe, it}
 # crystal's spec_helper loads the dummy driver too; without a Statement
-# subclass in the program iyi_db/core (which iyi_db/spec uses) does not type.
-import iyi_db/testing/dummy_driver::*
+# subclass in the program db/core (which db/spec uses) does not type.
+import db/testing/dummy_driver::*
 
 # spec/support/http.cr's `wait_for`: `Fiber.yield` is `sleep 0`.
 def wait_for(timeout : Span = Span.seconds(5), &)
@@ -153,7 +153,7 @@ def run_server(server : TestServer, &)
   end
 end
 
-describe "IyiDb::Pool" do
+describe "Db::Pool" do
   it "distributes evenly the requests" do
     server = TestServer.new
 

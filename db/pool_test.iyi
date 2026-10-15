@@ -1,13 +1,13 @@
 # crystal-db's spec/pool_spec.cr.
-module iyi_db/pool_test
+module db/pool_test
 
-import iyi_db/errors::*
-import iyi_db/core::{Disposable}
-import iyi_db/pooling::{Pool}
-import iyi_db/spec::{describe, it, expect_error}
+import db/errors::*
+import db/core::{Disposable}
+import db/pooling::{Pool}
+import db/spec::{describe, it, expect_error}
 # crystal's spec_helper loads the dummy driver too; without a Statement
-# subclass in the program iyi_db/core does not type (see the port report).
-import iyi_db/testing/dummy_driver::*
+# subclass in the program db/core does not type (see the port report).
+import db/testing/dummy_driver::*
 
 class ShouldSleepingOp
   @is_sleeping = false
@@ -83,7 +83,7 @@ def create_pool(options : Pool::Options = Pool::Options.new, &factory : -> Closa
   pool
 end
 
-describe "IyiDb::Pool" do
+describe "Db::Pool" do
   it "should use proc to create objects" do
     block_called = 0
     pool = create_pool(Pool::Options.new(initial_pool_size: 3)) { block_called += 1; Closable.new }

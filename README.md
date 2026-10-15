@@ -26,24 +26,25 @@ iyi get github.com/iyilang/db --as db
 which writes this line to `iyi.mod`:
 
 ```
-require github.com/iyilang/db v0.1.0 as db
+require github.com/iyilang/db v0.1.1 as db
 ```
 
-Files then import its modules as `db/iyi_db/...`.
+Files then import its modules as `db/db/...`: the short name, then the
+module's path in the package.
 
 ## Usage
 
 ```iyi
 module app
 
-import db/iyi_db/db
-import db/iyi_db/core::*
-import db/iyi_db/errors::{DBError}
-import db/iyi_db/value::{DBValue}
+import db/db/db
+import db/db/core::*
+import db/db/errors::{DBError}
+import db/db/value::{DBValue}
 import sqlite3/sqlite3 # a driver: importing it registers "sqlite3"
 
 def contacts : Nil | DBError
-  IyiDb::Db.open("sqlite3:./file.db") do |db|
+  Db::Db.open("sqlite3:./file.db") do |db|
     db.exec("create table contacts (name text, age integer)")!
     db.exec("insert into contacts values (?, ?)", "John Doe", 30)!
 
@@ -90,7 +91,7 @@ choose how statements run.
 ### Reading rows into objects
 
 ```iyi
-import db/iyi_db/serializable::{db_serializable, DBField}
+import db/db/serializable::{db_serializable, DBField}
 
 class Employee
   property title : String
@@ -113,7 +114,7 @@ property for. `Employee.from_db_row(rs)` reads the current row and
 ### Logging and instrumentation
 
 Every statement logs `Executing query -- query: "...", args: [...]` at debug
-level to the std/log logger `"db"` (`IyiDb::Core::LOG`).
+level to the std/log logger `"db"` (`Db::Core::LOG`).
 `Statement.def_around_query_or_exec { |stmt, args, run| ...; run.call; ... }`
 wraps every query a driver runs.
 
@@ -121,14 +122,14 @@ wraps every query a driver runs.
 
 | module | what it holds |
 |---|---|
-| `iyi_db/db` | `IyiDb::Db.open`, `.connect`, `.register_driver`, `.driver_class`, `VERSION` |
-| `iyi_db/core` | `Driver`, `ConnectionBuilder`, `Database`, `Connection`, `Statement`, `ResultSet`, transactions, `PoolStatement`s, the `QueryMethods`/`SessionMethods`/`StatementMethods`/`BeginTransaction`/`Disposable`/`ConnectionContext` traits, `LOG` |
-| `iyi_db/errors` | `DBError` and its subclasses |
-| `iyi_db/value` | `DBValue`, `CustomValue`, `Any`, `ExecResult` |
-| `iyi_db/pooling` | `Pool(T)`, usable for any resource with a `close` |
-| `iyi_db/query_params` | `fetch_bool`, `fetch_int`, `fetch_float` for URI options |
-| `iyi_db/serializable` | `derive db_serializable`, `DBField`, `mapping` |
-| `iyi_db/spec` | `DriverSpecs`, and `describe`/`it`/`expect_error` for tests |
+| `db/db` | `Db::Db.open`, `.connect`, `.register_driver`, `.driver_class`, `VERSION` |
+| `db/core` | `Driver`, `ConnectionBuilder`, `Database`, `Connection`, `Statement`, `ResultSet`, transactions, `PoolStatement`s, the `QueryMethods`/`SessionMethods`/`StatementMethods`/`BeginTransaction`/`Disposable`/`ConnectionContext` traits, `LOG` |
+| `db/errors` | `DBError` and its subclasses |
+| `db/value` | `DBValue`, `CustomValue`, `Any`, `ExecResult` |
+| `db/pooling` | `Pool(T)`, usable for any resource with a `close` |
+| `db/query_params` | `fetch_bool`, `fetch_int`, `fetch_float` for URI options |
+| `db/serializable` | `derive db_serializable`, `DBField`, `mapping` |
+| `db/spec` | `DriverSpecs`, and `describe`/`it`/`expect_error` for tests |
 
 ## What is different from crystal-db
 
@@ -137,7 +138,7 @@ crystal-db's.
 
 | crystal-db | iyi-db | why |
 |---|---|---|
-| `DB.open(uri)` raises | `IyiDb::Db.open(uri) : Database \| DBError` - every fallible call answers its error, `!` hands it on | III.1: errors are values |
+| `DB.open(uri)` raises | `Db::Db.open(uri) : Database \| DBError` - every fallible call answers its error, `!` hands it on | III.1: errors are values |
 | `DB::Error`, `DB::MappingException`, ... | `DBError`, `MappingError`, ... - the same hierarchy as classes implementing `Error`; `ArgumentError` is a `DBError` too | III.1 |
 | `rescue`/`ensure` around `close` | `close : Nil \| DBError`, and `defer` | III.1.4 |
 | `raise DB::Rollback.new` in a `transaction` block | the block answers `Rollback.new` (the transaction answers `nil`); answering any other error rolls back and answers it | no exceptions |
@@ -158,7 +159,7 @@ crystal-db's.
 
 Subclass `Driver` (answer a `ConnectionBuilder` from `connection_builder(uri)`),
 `ConnectionBuilder`, `Connection`, `Statement` and `ResultSet` from
-`iyi_db/core`, and call `IyiDb::Db.register_driver("name", MyDriver)` at the
+`db/core`, and call `Db::Db.register_driver("name", MyDriver)` at the
 top level of the driver's module, so importing the driver registers it. The
 abstract methods say what to implement; the comments on `Driver`,
 `Connection`, `Statement` and `ResultSet` say how. A lost connection answers
@@ -173,7 +174,7 @@ does not match.
 Test a driver with the shared specs:
 
 ```iyi
-import db/iyi_db/spec::{DriverSpecs}
+import db/db/spec::{DriverSpecs}
 
 DriverSpecs.run do |specs|
   specs.connection_string "sqlite3:./test.db"
@@ -183,15 +184,15 @@ DriverSpecs.run do |specs|
 end
 ```
 
-`iyi_db/driver_specs_test.iyi` runs them against an in-memory driver.
+`db/driver_specs_test.iyi` runs them against an in-memory driver.
 
 ## Development
 
 ```sh
-iyi test iyi_db     # every *_test.iyi
+iyi test db     # every *_test.iyi
 ```
 
-The tests are crystal-db's specs, ported; `iyi_db/testing/dummy_driver.iyi` is
+The tests are crystal-db's specs, ported; `db/testing/dummy_driver.iyi` is
 its dummy driver. Every test also builds from artifacts
 (`iyi build --emit-iyimod DIR` then `--use-iyimod DIR`). `manual/` holds the
 two programs crystal-db runs by hand:

@@ -24,16 +24,16 @@
 #   `tx.commit` before a `return` that should commit.
 # * Statement instrumentation is `Statement.def_around_query_or_exec { ... }`,
 #   a hook registry, because there is no reopening `DB::Statement` here (R-3).
-module iyi_db/core
+module db/core
 
 import std/uri::{URI, Params}
 import std/log::{Log, Logger}
 import std/random::{Random}
 import std/text
-import iyi_db/errors::*
-import iyi_db/value::*
-import iyi_db/query_params::*
-import iyi_db/pooling::*
+import db/errors::*
+import db/value::*
+import db/query_params::*
+import db/pooling::*
 
 # The logger every statement writes "Executing query" to, at debug level.
 # crystal-db's `DB::Log`; its source is "db".
@@ -60,7 +60,7 @@ pub trait Disposable
 end
 
 # Where a connection goes back to: the `Database` whose pool it belongs to,
-# or nowhere for a connection made with `IyiDb::Db.connect`.
+# or nowhere for a connection made with `Db::Db.connect`.
 pub trait ConnectionContext
   # The *connection* was closed for good and must not be used again.
   abstract def discard(connection : Connection) : Nil
@@ -425,7 +425,7 @@ end
 
 # One active connection to a database. Driver implementors subclass it.
 #
-# A program does not build a connection: `IyiDb::Db.connect` opens one, and
+# A program does not build a connection: `Db::Db.connect` opens one, and
 # `Database#checkout` and `Database#using_connection` lend one from the pool.
 # Its `QueryMethods` are documented there.
 #
@@ -496,7 +496,7 @@ pub abstract class Connection
   abstract def build_unprepared_statement(query : String) : Statement | DBError
 
   # Returns the canonical name of the driver backing this connection: one of
-  # the names the driver registers with `IyiDb::Db.register_driver` (e.g.
+  # the names the driver registers with `Db::Db.register_driver` (e.g.
   # `"postgres"`, `"mysql"`, `"sqlite3"`).
   abstract def driver_name : String
 
@@ -762,7 +762,7 @@ end
 
 AROUND_HOOKS = AroundHooks.new
 
-# The rows a query answered. See `IyiDb::Db` for a complete sample.
+# The rows a query answered. See `Db::Db` for a complete sample.
 #
 # Each `#read` consumes a column and moves to the next one, so columns are
 # read in order. `#move_next` may be called at any time, skipping the rest of
@@ -1054,13 +1054,13 @@ pub abstract class ConnectionBuilder
 end
 
 # Database driver implementors subclass `Driver`, register it with a
-# driver name using `IyiDb::Db.register_driver` and implement the factory
+# driver name using `Db::Db.register_driver` and implement the factory
 # method `#connection_builder`.
 #
 # ```
-# import db/iyi_db/db
-# import db/iyi_db/core::*
-# import db/iyi_db/errors::{DBError}
+# import db/db/db
+# import db/db/core::*
+# import db/db/errors::{DBError}
 # import std/uri::{URI, Params}
 #
 # class FakeConnectionBuilder < ConnectionBuilder
@@ -1082,13 +1082,13 @@ end
 #   end
 # end
 #
-# IyiDb::Db.register_driver "fake", FakeDriver
+# Db::Db.register_driver "fake", FakeDriver
 # ```
 #
 # Access to this fake database will be available with
 #
 # ```
-# IyiDb::Db.open("fake://...") do |db|
+# Db::Db.open("fake://...") do |db|
 #   # ... use db ...
 # end
 # ```
@@ -1118,7 +1118,7 @@ pub abstract class Driver
 end
 
 # Acts as an entry point for database access. Connections are managed by a
-# pool. Use `IyiDb::Db.open` to create a `Database`.
+# pool. Use `Db::Db.open` to create a `Database`.
 #
 # Refer to `QueryMethods` and `SessionMethods` for querying the database.
 #
@@ -1194,7 +1194,7 @@ pub class Database
   # that connection out of the pool and is answered by whatever opened it.
   #
   # ```
-  # db = IyiDb::Db.open(DB_URL)!
+  # db = Db::Db.open(DB_URL)!
   # db.setup_connection do |connection|
   #   connection.exec("SET TIME ZONE 'America/New_York'")!
   #   nil

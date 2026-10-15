@@ -1,10 +1,10 @@
 # crystal-db's spec/result_set_spec.cr.
-module iyi_db/result_set_test
+module db/result_set_test
 
-import iyi_db/errors::*
-import iyi_db/core::*
-import iyi_db/spec::{describe, it, expect_error}
-import iyi_db/testing/dummy_driver::*
+import db/errors::*
+import db/core::*
+import db/spec::{describe, it, expect_error}
+import db/testing/dummy_driver::*
 
 def closed?(rs : ResultSet?) : Bool
   if r = rs
