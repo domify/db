@@ -1,8 +1,7 @@
-## v0.15.0
+## v0.1.0
 
 The first release of iyi-db: crystal-db 0.15.0 ported to iyi, in iyi, with no
-Crystal code left. The version follows crystal-db's, so a driver ported from
-Crystal can say which crystal-db it matches.
+Crystal code left.
 
 * `IyiDb::Db.open`, `.connect` and `.register_driver` (module `iyi_db/db`) are
   crystal-db's `DB.open`, `DB.connect` and `DB.register_driver`.

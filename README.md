@@ -17,17 +17,16 @@ iyi 0.17.0 or later.
 
 ## Installation
 
-iyi-db is an iyi module. A project requires it in its `iyi.mod`, under the
-short name `db`:
+iyi-db is an iyi module. Add it to a project under the short name `db`:
+
+```sh
+iyi get github.com/iyilang/db --as db
+```
+
+which writes this line to `iyi.mod`:
 
 ```
-require iyi-db v0.15.0 as db
-```
-
-and, while working against a local checkout, points the requirement at it:
-
-```
-replace iyi-db => ../iyi-db
+require github.com/iyilang/db v0.1.0 as db
 ```
 
 Files then import its modules as `db/iyi_db/...`.

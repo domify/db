@@ -86,7 +86,7 @@ import std/uri::{URI, Params}
 import iyi_db/errors::*
 import iyi_db/core::*
 
-pub VERSION = "0.15.0"
+pub VERSION = "0.1.0"
 
 DRIVERS = {} of String => Driver.class
 
