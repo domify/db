@@ -58,6 +58,10 @@ class FooDriver < Driver
       DBError.new("not implemented")
     end
 
+    def transaction_state : TransactionState
+      TransactionState::Idle
+    end
+
     def driver_name : String
       "foo"
     end
@@ -159,6 +163,10 @@ class BarDriver < Driver
 
     def build_unprepared_statement(query : String) : Statement | DBError
       DBError.new("not implemented")
+    end
+
+    def transaction_state : TransactionState
+      TransactionState::Idle
     end
 
     def driver_name : String

@@ -24,3 +24,16 @@ describe "Connection" do
     end
   end
 end
+
+# Exercise the public contract through the abstract connection type.
+def state_of(connection : Connection) : TransactionState
+  connection.transaction_state
+end
+
+with_dummy_connection do |cnn|
+  assert state_of(cnn) == TransactionState::Idle
+  cnn.transaction_state = TransactionState::InTransaction
+  assert state_of(cnn) == TransactionState::InTransaction
+  cnn.transaction_state = TransactionState::FailedTransaction
+  assert state_of(cnn) == TransactionState::FailedTransaction
+end

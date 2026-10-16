@@ -122,6 +122,10 @@ class MemoryConnection < Connection
     MemoryStatement.new(self, query, false)
   end
 
+  def transaction_state : TransactionState
+    TransactionState::Idle
+  end
+
   def driver_name : String
     "memory"
   end

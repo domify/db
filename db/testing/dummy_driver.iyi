@@ -77,6 +77,8 @@ pub class DummyConnection < Connection
     statement
   end
 
+  property transaction_state : TransactionState = TransactionState::Idle
+
   def driver_name : String
     "dummy"
   end

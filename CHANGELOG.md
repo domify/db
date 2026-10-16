@@ -1,3 +1,10 @@
+# Unreleased
+
+Connection#transaction_state is an abstract driver contract returning TransactionState::Idle,
+TransactionState::InTransaction or TransactionState::FailedTransaction. It reports actual database
+state, including raw SQL transactions, independently of db transaction object bookkeeping. Read it
+after consuming the response and before closing the connection. Driver subclasses must implement it.
+
 ## v0.1.1
 
 The modules move from `iyi_db/` to `db/`, so their namespace is `Db::...`

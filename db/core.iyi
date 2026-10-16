@@ -423,6 +423,14 @@ pub trait BeginTransaction
   end
 end
 
+# The actual database state, including transactions started with raw SQL.
+# FailedTransaction requires rollback before ordinary statements can succeed.
+pub enum TransactionState
+  Idle
+  InTransaction
+  FailedTransaction
+end
+
 # One active connection to a database. Driver implementors subclass it.
 #
 # A program does not build a connection: `Db::Db.connect` opens one, and
@@ -498,6 +506,11 @@ pub abstract class Connection
   # Returns the canonical name of the driver backing this connection: one of
   # the names the driver registers with `Db::Db.register_driver` (e.g.
   # `"postgres"`, `"mysql"`, `"sqlite3"`).
+  # Reports database state, independently of the transaction objects managed here.
+  # Drivers must read native state or retain the server's transaction status.
+  # Only meaningful while this connection is open and its response is consumed.
+  abstract def transaction_state : TransactionState
+
   abstract def driver_name : String
 
   # Returns the product name the server identifies as (e.g. `"PostgreSQL"`,

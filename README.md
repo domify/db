@@ -208,3 +208,10 @@ return type" there. A program that imports a driver checks clean.
 
 - [bcardiff](https://github.com/bcardiff) Brian J. Cardiff - creator and
   maintainer of crystal-db
+
+## Actual transaction state
+
+Connection#transaction_state is an abstract driver contract returning TransactionState::Idle,
+TransactionState::InTransaction or TransactionState::FailedTransaction. It reports actual database
+state, including raw SQL transactions, independently of db transaction object bookkeeping. Read it
+after consuming the response and before closing the connection. Driver subclasses must implement it.
