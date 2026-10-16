@@ -1,5 +1,8 @@
 # Unreleased
 
+The memory driver contract specs also verify raw SQL and savepoint state with prepared statements
+enabled and disabled.
+
 Connection#transaction_state is an abstract driver contract returning TransactionState::Idle,
 TransactionState::InTransaction or TransactionState::FailedTransaction. It reports actual database
 state, including raw SQL transactions, independently of db transaction object bookkeeping. Read it

@@ -123,7 +123,7 @@ class MemoryConnection < Connection
   end
 
   def transaction_state : TransactionState
-    TransactionState::Idle
+    @working.nil? ? TransactionState::Idle : TransactionState::InTransaction
   end
 
   def driver_name : String
@@ -524,6 +524,23 @@ DriverSpecs.run do |specs|
     db.exec("create table table1 (col1 int not null)").or_panic
     assert db.exec("insert into table1 (col1) values (?)", 7).or_panic.rows_affected == 1
     assert db.query_one("select col1 from table1", as: Int32).or_panic == 7
+  end
+
+  specs.it "reports raw transaction state independently of managed transactions", prepared: :both do |db|
+    db.using_connection do |conn|
+      assert conn.transaction_state == TransactionState::Idle
+      conn.exec("BEGIN").or_panic
+      assert conn.transaction_state == TransactionState::InTransaction
+      conn.exec("SAVEPOINT state_check").or_panic
+      conn.exec("ROLLBACK TO state_check").or_panic
+      assert conn.transaction_state == TransactionState::InTransaction
+      conn.exec("COMMIT").or_panic
+      assert conn.transaction_state == TransactionState::Idle
+      conn.exec("BEGIN").or_panic
+      conn.exec("ROLLBACK").or_panic
+      assert conn.transaction_state == TransactionState::Idle
+      nil
+    end.or_panic
   end
 
   specs.it "commits a transaction only on COMMIT", prepared: :both do |db|

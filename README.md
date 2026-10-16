@@ -215,3 +215,12 @@ Connection#transaction_state is an abstract driver contract returning Transactio
 TransactionState::InTransaction or TransactionState::FailedTransaction. It reports actual database
 state, including raw SQL transactions, independently of db transaction object bookkeeping. Read it
 after consuming the response and before closing the connection. Driver subclasses must implement it.
+
+For an open connection, raw SQL and transaction objects share the same state reader:
+
+```iyi
+connection.exec("BEGIN").or_panic
+assert connection.transaction_state == TransactionState::InTransaction
+connection.exec("ROLLBACK").or_panic
+assert connection.transaction_state == TransactionState::Idle
+```
