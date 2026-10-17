@@ -16,6 +16,7 @@ module db/driver_specs_test
 
 import std/uri::{URI, Params}
 import std/text
+import std/indexable
 import db/db
 import db/errors::*
 import db/value::*
