@@ -833,6 +833,32 @@ pub abstract class ResultSet
   # Reads the next column value.
   abstract def read : DBValue | DBError
 
+  # Reads the next column's text onto the running fiber's tape: `nil` for
+  # NULL, `ColumnTypeMismatchError` for a column that is not text or bytes.
+  # This default copies the heap value `#read` makes; drivers override it to
+  # copy the column's bytes straight onto the tape.
+  def read_tape : Tape::String | Nil | DBError
+    index = next_column_index
+    value = read
+    return value if value.is_a?(DBError)
+    case value
+    when Nil then nil
+    when String then Tape::String.new(value)
+    when ::Std::Slice::Bytes
+      writer = Tape::String::Writer.new(value.size)
+      writer.append(value.to_unsafe, value.size) if value.size > 0
+      writer.finish
+    else
+      ColumnTypeMismatchError.new(
+        context: "#{self.class}#read_tape",
+        column_index: index,
+        column_name: column_name(index),
+        column_type: value.class.to_s,
+        expected_type: "Tape::String"
+      )
+    end
+  end
+
   # Returns the index of the column the next `#read` reads; `#column_count`
   # once the last column of the row has been read.
   abstract def next_column_index : Int32
