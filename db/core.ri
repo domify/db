@@ -843,7 +843,7 @@ pub abstract class ResultSet
     when String then Tape::String.new(value)
     when ::Std::Slice::Bytes
       writer = Tape::String::Writer.new(value.size)
-      writer.append(value.to_unsafe, value.size) if value.size > 0
+      value.each { |byte| writer.push(byte) }
       writer.finish
     else
       value
