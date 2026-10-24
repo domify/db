@@ -834,15 +834,15 @@ pub abstract class ResultSet
   abstract def read : DBValue | DBError
 
   # Reads the next column with its text or bytes on the running fiber's
-  # tape as a `Tape::String`; any other value as `#read` answers it. This
+  # tape as a `Str`; any other value as `#read` answers it. This
   # default copies the heap value `#read` makes; drivers override it to copy
   # the column's bytes straight onto the tape.
-  def read_tape : Tape::String | DBValue | DBError
+  def read_tape : Str | DBValue | DBError
     value = read
     case value
-    when String then Tape::String.new(value)
+    when String then Str.new(value)
     when ::Std::Slice::Bytes
-      writer = Tape::String::Writer.new(value.size)
+      writer = Str::Builder.new(value.size)
       value.each { |byte| writer.push(byte) }
       writer.finish
     else
