@@ -1,7 +1,7 @@
 # Reading the rows of a result set into structs and classes: crystal-db's
 # `DB::Serializable` and its deprecated `DB.mapping`.
 #
-# `include DB::Serializable` becomes a derive, the way iyi adds methods to a
+# `include DB::Serializable` becomes a derive, the way ris adds methods to a
 # type (SPEC.md II.4):
 #
 # ```
@@ -16,9 +16,9 @@
 #   derive db_serializable
 # end
 #
-# employees = Employee.from_rs(db.query("SELECT title, firstname FROM employees")!)!
-# employees[0].title # => "Manager"
-# employees[0].name  # => "John"
+# db.query("SELECT title, firstname FROM employees") do |rs|
+#   Employee.from_rs(rs) { |employee| puts employee.title }
+# end
 # ```
 #
 # The derive gives the type two class methods:
@@ -80,6 +80,23 @@ pub macro db_serializable_with(declaration, strict)
     new(__iyi_db_values: values)
   end
 
+  # Reads an object within the scope that owns its column text.
+  def self.from_db_row(rs : ::Db::Core::ResultSet, & : self -> U) : U | ::Db::Errors::DBError forall U
+    values = allocate.__iyi_db_read_values(rs)
+    return values if values.is_a?(::Db::Errors::DBError)
+    object = new(__iyi_db_values: values)
+    yield object
+  end
+
+  # Visits every object and closes the result set.
+  def self.from_rs(rs : ::Db::Core::ResultSet, & : self -> Nil) : Nil | ::Db::Errors::DBError
+    defer rs.close
+    rs.each do
+      result = from_db_row(rs) { |object| yield object }
+      return result if result.is_a?(::Db::Errors::DBError)
+    end
+  end
+
   # Reads every row of *rs*, and closes it.
   def self.from_rs(rs : ::Db::Core::ResultSet) : Array(self) | ::Db::Errors::DBError
     defer rs.close
@@ -133,7 +150,7 @@ pub macro db_serializable_with(declaration, strict)
             __iyi_db_read_\{{ name }} = rs.read(typeof(@\{{ name }}))
           \{% end %}
           if __iyi_db_read_\{{ name }}.is_a?(::Db::Errors::DBError)
-            return ::Db::Errors::MappingError.new(__iyi_db_read_\{{ name }}.message, self.class.to_s, \{{ name.stringify }}, cause: __iyi_db_read_\{{ name }})
+            return ::Db::Errors::MappingError.new(__iyi_db_read_\{{ name }}.message + "\n  deserializing #{self.class}#" + \{{ name.stringify }})
           end
           __iyi_db_value_\{{ name }} = __iyi_db_read_\{{ name }}
         \{% end %}
@@ -141,7 +158,7 @@ pub macro db_serializable_with(declaration, strict)
           skipped = rs.read
           return skipped if skipped.is_a?(::Db::Errors::DBError)
           {% if strict %}
-            return ::Db::Errors::MappingError.new("Unknown column: #{col_name}", self.class.to_s)
+            return ::Db::Errors::MappingError.new("Unknown column: #{col_name}\n  deserializing #{self.class}")
           {% end %}
         end
       end
@@ -150,7 +167,7 @@ pub macro db_serializable_with(declaration, strict)
         skipped = rs.read
         return skipped if skipped.is_a?(::Db::Errors::DBError)
         {% if strict %}
-          return ::Db::Errors::MappingError.new("Unknown column: #{col_name}", self.class.to_s)
+          return ::Db::Errors::MappingError.new("Unknown column: #{col_name}\n  deserializing #{self.class}")
         {% end %}
       end
       \{% end %}
@@ -158,7 +175,7 @@ pub macro db_serializable_with(declaration, strict)
       \{% for name, value in properties %}
         \{% unless value[:nilable] || value[:has_default] %}
           if __iyi_db_value_\{{ name }}.nil? && !__iyi_db_found_\{{ name }}
-            return ::Db::Errors::MappingError.new("Missing column " + \{{ value[:key] }}, self.class.to_s, \{{ name.stringify }})
+            return ::Db::Errors::MappingError.new("Missing column " + \{{ value[:key] }} + "\n  deserializing #{self.class}#" + \{{ name.stringify }})
           end
         \{% end %}
       \{% end %}
@@ -294,7 +311,7 @@ pub macro mapping(properties, strict = true)
         %skipped = %rs.read
         return %skipped if %skipped.is_a?(::Db::Errors::DBError)
         {% if strict %}
-          return ::Db::Errors::MappingError.new("unknown result set attribute: #{col_name}", self.to_s)
+          return ::Db::Errors::MappingError.new("unknown result set attribute: #{col_name}\n  deserializing #{self}")
         {% end %}
       end
     end
@@ -302,7 +319,7 @@ pub macro mapping(properties, strict = true)
     {% for key, value in properties %}
       {% unless value[:nilable] || value[:default] != nil %}
         if %var{key.id}.is_a?(Nil) && !%found{key.id}
-          return ::Db::Errors::MappingError.new("missing result set attribute: {{ (value[:key] || key).id }}", self.to_s)
+          return ::Db::Errors::MappingError.new("missing result set attribute: {{ (value[:key] || key).id }}\n  deserializing #{self}")
         end
       {% end %}
     {% end %}
@@ -324,4 +341,72 @@ pub macro mapping(properties, strict = true)
 
     new(__iyi_db_mapping_values: { {% for key, value in properties %} {{ key.id }}: %final{key.id}, {% end %} })
   end
+
+  # Reads the current row of *rs*.
+  def self.from_db_row(%rs : ::Db::Core::ResultSet, & : self -> U) : U | ::Db::Errors::DBError forall U
+    {% for key, value in properties %}
+      %var{key.id} = nil
+      %found{key.id} = false
+    {% end %}
+
+    %rs.each_column do |col_name|
+      case col_name
+        {% for key, value in properties %}
+          when {{ value[:key] || key.id.stringify }}
+            %found{key.id} = true
+            %read{key.id} =
+              {% if value[:converter] %}
+                {{ value[:converter] }}.from_rs(%rs)
+              {% elsif value[:nilable] || value[:default] != nil %}
+                %rs.read(::Union({{ value[:type] }} | Nil))
+              {% else %}
+                %rs.read({{ value[:type] }})
+              {% end %}
+            return %read{key.id} if %read{key.id}.is_a?(::Db::Errors::DBError)
+            %var{key.id} = %read{key.id}
+        {% end %}
+      else
+        %skipped = %rs.read
+        return %skipped if %skipped.is_a?(::Db::Errors::DBError)
+        {% if strict %}
+          return ::Db::Errors::MappingError.new("unknown result set attribute: #{col_name}\n  deserializing #{self}")
+        {% end %}
+      end
+    end
+
+    {% for key, value in properties %}
+      {% unless value[:nilable] || value[:default] != nil %}
+        if %var{key.id}.is_a?(Nil) && !%found{key.id}
+          return ::Db::Errors::MappingError.new("missing result set attribute: {{ (value[:key] || key).id }}\n  deserializing #{self}")
+        end
+      {% end %}
+    {% end %}
+
+    {% for key, value in properties %}
+      {% if value[:nilable] %}
+        {% if value[:default] != nil %}
+          %final{key.id} = %found{key.id} ? %var{key.id} : {{ value[:default] }}
+        {% else %}
+          %final{key.id} = %var{key.id}
+        {% end %}
+      {% elsif value[:default] != nil %}
+        %set{key.id} = %var{key.id}
+        %final{key.id} = %set{key.id}.is_a?(Nil) ? {{ value[:default] }} : %set{key.id}
+      {% else %}
+        %final{key.id} = %var{key.id}.as({{ value[:type] }})
+      {% end %}
+    {% end %}
+
+    %object = new(__iyi_db_mapping_values: { {% for key, value in properties %} {{ key.id }}: %final{key.id}, {% end %} })
+    yield %object
+  end
+
+  def self.from_rs(%rs : ::Db::Core::ResultSet, & : self -> Nil) : Nil | ::Db::Errors::DBError
+    defer %rs.close
+    %rs.each do
+      %result = from_db_row(%rs) { |object| yield object }
+      return %result if %result.is_a?(::Db::Errors::DBError)
+    end
+  end
+
 end

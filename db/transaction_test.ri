@@ -1,281 +1,228 @@
-# crystal-db's spec/transaction_spec.cr.
 module db/transaction_test
 
-import db/db
 import db/errors::*
 import db/core::*
 import db/spec::{describe, it, expect_error}
 import db/testing/dummy_driver::*
 
-# crystal's FooException: errors are values in iyi.
-class FooError < DBError
+struct FooError < DBError
   def initialize
     super("foo")
   end
 end
 
-# Leaves the transaction block with `return`: iyi rolls the transaction back.
-def return_from_txn(cnn : Connection) : Transaction
+def leave_transaction(cnn : Connection, commit : Bool) : Nil | DBError
   cnn.transaction do |tx|
-    return tx
+    tx.commit! if commit
+    return nil
   end
-  raise "unreachable"
-end
-
-# Commits the transaction, then leaves the block with `return`.
-def commit_and_return_from_txn(cnn : Connection) : Transaction
-  cnn.transaction do |tx|
-    tx.commit.or_panic
-    return tx
-  end
-  raise "unreachable"
 end
 
 describe "Transaction" do
   it "begin/commit transaction from connection" do
     with_dummy_connection do |cnn|
-      tx = cnn.begin_transaction.or_panic
-      tx.commit.or_panic
+      seen = false
+      result = cnn.transaction do |tx|
+        seen = true
+        assert tx.connection == cnn
+        tx.commit.or_panic
+      end
+      assert seen
+      assert result.nil?
+      assert cnn.commits == 1
+      assert cnn.rollbacks == 0
     end
   end
 
   it "begin/rollback transaction from connection" do
     with_dummy_connection do |cnn|
-      tx = cnn.begin_transaction.or_panic
-      tx.rollback.or_panic
-    end
-  end
-
-  it "raise if begin over existing transaction" do
-    with_dummy_connection do |cnn|
-      cnn.begin_transaction.or_panic
-      expect_error(cnn.begin_transaction, DBError, "There is an existing transaction in this connection")
-      nil
-    end
-  end
-
-  it "allow sequential transactions" do
-    with_dummy_connection do |cnn|
-      tx = cnn.begin_transaction.or_panic
-      tx.rollback.or_panic
-
-      tx = cnn.begin_transaction.or_panic
-      tx.commit.or_panic
+      seen = false
+      result = cnn.transaction do |tx|
+        seen = true
+        assert tx.connection == cnn
+        tx.rollback.or_panic
+      end
+      assert seen
+      assert result.nil?
+      assert cnn.commits == 0
+      assert cnn.rollbacks == 1
     end
   end
 
   it "transaction with block from connection should be committed" do
-    t : DummyTransaction? = nil
-
-    with_witness do |w|
-      with_dummy_connection do |cnn|
-        cnn.transaction do |tx|
-          if tx.is_a?(DummyTransaction)
-            t = tx
-            w.check
-          end
-        end.or_panic
+    with_dummy_connection do |cnn|
+      seen = false
+      result = cnn.transaction do |tx|
+        seen = true
+        assert tx.connection == cnn
+        nil
       end
+      assert seen
+      assert result.nil?
+      assert cnn.commits == 1
+      assert cnn.rollbacks == 0
     end
-
-    tx = t || raise "no transaction"
-    assert tx.committed
-    assert !tx.rolledback
   end
 
   it "transaction with block from connection should be rolledback if raise DB::Rollback" do
-    t : DummyTransaction? = nil
-
-    with_witness do |w|
-      with_dummy_connection do |cnn|
-        # the block answers Rollback instead of raising it
-        res = cnn.transaction do |tx|
-          if tx.is_a?(DummyTransaction)
-            t = tx
-            w.check
-          end
-          Rollback.new
-        end
-        assert res.nil?
+    with_dummy_connection do |cnn|
+      seen = false
+      result = cnn.transaction do |tx|
+        seen = true
+        assert tx.connection == cnn
+        Rollback.new
       end
+      assert seen
+      assert result.nil?
+      assert cnn.commits == 0
+      assert cnn.rollbacks == 1
     end
-
-    tx = t || raise "no transaction"
-    assert tx.rolledback
-    assert !tx.committed
   end
 
   it "transaction with block from connection should be rolledback if raise" do
-    t : DummyTransaction? = nil
-
-    with_witness do |w|
-      with_dummy_connection do |cnn|
-        # the block answers a FooError instead of raising FooException
-        res = cnn.transaction do |tx|
-          if tx.is_a?(DummyTransaction)
-            t = tx
-            w.check
-          end
-          FooError.new
-        end
-        expect_error(res, FooError)
-        nil
+    with_dummy_connection do |cnn|
+      seen = false
+      result = cnn.transaction do |tx|
+        seen = true
+        assert tx.connection == cnn
+        FooError.new
       end
+      assert seen
+      expect_error(result, FooError, "foo")
+      assert cnn.commits == 0
+      assert cnn.rollbacks == 1
     end
-
-    tx = t || raise "no transaction"
-    assert tx.rolledback
-    assert !tx.committed
-  end
-
-  # crystal commits when `return` leaves the block; iyi cannot tell `return`
-  # from `!` and rolls back. See the next example for committing then returning.
-  it "transaction with block from connection should be rolledback if `return` is called" do
-    t : DummyTransaction? = nil
-
-    with_witness do |w|
-      with_dummy_connection do |cnn|
-        t = return_from_txn(cnn).as(DummyTransaction)
-        w.check
-      end
-    end
-
-    tx = t || raise "no transaction"
-    assert tx.rolledback
-    assert !tx.committed
-  end
-
-  it "transaction with block from connection should be committed if committed before `return` is called" do
-    t : DummyTransaction? = nil
-
-    with_witness do |w|
-      with_dummy_connection do |cnn|
-        t = commit_and_return_from_txn(cnn).as(DummyTransaction)
-        w.check
-      end
-    end
-
-    tx = t || raise "no transaction"
-    assert !tx.rolledback
-    assert tx.committed
   end
 
   it "transaction can be committed within block" do
     with_dummy_connection do |cnn|
-      cnn.transaction do |tx|
+      seen = false
+      result = cnn.transaction do |tx|
+        seen = true
+        assert tx.connection == cnn
         tx.commit.or_panic
-      end.or_panic
+      end
+      assert seen
+      assert result.nil?
+      assert cnn.commits == 1
+      assert cnn.rollbacks == 0
     end
   end
 
   it "transaction can be rolledback within block" do
     with_dummy_connection do |cnn|
-      cnn.transaction do |tx|
+      seen = false
+      result = cnn.transaction do |tx|
+        seen = true
+        assert tx.connection == cnn
         tx.rollback.or_panic
-      end.or_panic
+      end
+      assert seen
+      assert result.nil?
+      assert cnn.commits == 0
+      assert cnn.rollbacks == 1
     end
   end
 
   it "transaction can be rolledback within block and later raise" do
     with_dummy_connection do |cnn|
-      res = cnn.transaction do |tx|
+      seen = false
+      result = cnn.transaction do |tx|
+        seen = true
+        assert tx.connection == cnn
         tx.rollback.or_panic
         FooError.new
       end
-      expect_error(res, FooError)
-      nil
+      assert seen
+      expect_error(result, FooError, "foo")
+      assert cnn.commits == 0
+      assert cnn.rollbacks == 1
     end
   end
 
   it "transaction can be rolledback within block and later raise DB::Rollback without forwarding it" do
     with_dummy_connection do |cnn|
-      res = cnn.transaction do |tx|
+      seen = false
+      result = cnn.transaction do |tx|
+        seen = true
+        assert tx.connection == cnn
         tx.rollback.or_panic
         Rollback.new
       end
-      assert res.nil?
+      assert seen
+      assert result.nil?
+      assert cnn.commits == 0
+      assert cnn.rollbacks == 1
     end
   end
 
-  it "transaction can't be committed twice" do
+  it "raise if begin over existing transaction" do
     with_dummy_connection do |cnn|
       cnn.transaction do |tx|
-        tx.commit.or_panic
-        expect_error(tx.commit, DBError, "Transaction already closed")
+        expect_error(cnn.transaction { |_| }, DBError, "There is an existing transaction in this connection")
         nil
       end.or_panic
     end
   end
 
-  it "transaction can't be rolledback twice" do
+  it "allow sequential transactions" do
     with_dummy_connection do |cnn|
-      cnn.transaction do |tx|
-        tx.rollback.or_panic
-        expect_error(tx.rollback, DBError, "Transaction already closed")
-        nil
-      end.or_panic
+      cnn.transaction { |tx| tx.rollback }.or_panic
+      cnn.transaction { |tx| tx.commit }.or_panic
+      assert cnn.commits == 1
+      assert cnn.rollbacks == 1
     end
   end
 
-  it "return connection to pool after transaction block in db" do
-    DummyConnection.clear_connections
-
-    with_dummy do |db|
-      db.transaction do |tx|
-        assert !db.pool.is_available?(DummyConnection.connections.first)
-      end.or_panic
-      assert db.pool.is_available?(DummyConnection.connections.first)
-    end
-  end
-
-  it "releasing result_set from within transaction should not return connection to pool" do
-    the_cnn : Connection? = nil
-    with_dummy do |db|
-      db.transaction do |tx|
-        cnn = tx.connection
-        the_cnn = cnn
-        cnn.scalar("1").or_panic
-        assert !db.pool.is_available?(cnn)
-      end.or_panic
-      assert db.pool.is_available?(the_cnn || raise "no connection")
-    end
-  end
-
-  # `typeof(res)` also includes DBError in iyi: transaction answers T | Nil | DBError
-  it "returns block value when sucess" do
-    with_dummy_connection do |cnn|
-      res = cnn.transaction do |tx|
-        42
+  {% for commit in [false, true] %}
+    it "early return with explicit commit {{commit}}" do
+      with_dummy_connection do |cnn|
+        leave_transaction(cnn, {{commit}}).or_panic
+        assert cnn.commits == ({{commit}} ? 1 : 0)
+        assert cnn.rollbacks == ({{commit}} ? 0 : 1)
       end
+    end
+  {% end %}
 
-      assert res == 42
-      assert typeof(res).to_s == typeof(42, nil, DBError.new("")).to_s
+  {% for method in [:commit, :rollback] %}
+    it "transaction can't be {{method.id}} twice" do
+      with_dummy_connection do |cnn|
+        cnn.transaction do |tx|
+          tx.{{method.id}}.or_panic
+          expect_error(tx.{{method.id}}, DBError, "Transaction already closed")
+          nil
+        end.or_panic
+      end
+    end
+  {% end %}
+
+  it "returns block value when success" do
+    with_dummy_connection do |cnn|
+      result = cnn.transaction { |_| 42 }
+      assert result.or_panic == 42
+      assert typeof(result).to_s == (Int32 | Nil | DBError).to_s
+      assert cnn.commits == 1
     end
   end
 
   it "returns value on rollback via method" do
     with_dummy_connection do |cnn|
-      res = cnn.transaction do |tx|
+      result = cnn.transaction do |tx|
         tx.rollback.or_panic
         42
       end
-
-      assert res == 42
-      assert typeof(res).to_s == typeof(42, nil, DBError.new("")).to_s
+      assert result.or_panic == 42
+      assert typeof(result).to_s == (Int32 | Nil | DBError).to_s
+      assert cnn.rollbacks == 1
     end
   end
 
-  # the Rollback is the block's value, so the block cannot also answer 42:
-  # a branch keeps Int32 in its type.
-  it "returns nil on rollback via exception" do
+  it "returns nil on rollback via error" do
     with_dummy_connection do |cnn|
-      rollback = true
-      res = cnn.transaction do |tx|
-        rollback ? Rollback.new : 42
-      end
-
-      assert res.nil?
-      assert typeof(res).to_s == typeof(42, nil, Rollback.new, DBError.new("")).to_s
+      result = cnn.transaction { |_| true ? Rollback.new : 42 }
+      assert result.nil?
+      assert typeof(result).to_s == (Int32 | Nil | DBError).to_s
+      assert cnn.rollbacks == 1
     end
   end
 end

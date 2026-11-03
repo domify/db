@@ -1,9 +1,9 @@
 # The values that cross the boundary between a program and a driver.
 #
 # crystal-db accepts any object as a query argument and lets each driver's
-# overloads decide, and reads whatever union a driver's `read` answers. iyi
+# overloads decide, and reads whatever union a driver's `read` answers. ris
 # names that set: `DBValue`, the prelude's scalars, `Time`, `Span`, `Bytes`,
-# arrays of database values, and `CustomValue`, the class a driver's own
+# nested arrays as `DBArray` positions in a `DBArrays`, and `CustomValue`, the class a driver's own
 # value types (crystal-pg's geometric types, a driver's `FooValue`) inherit.
 #
 # A union and a class rather than a trait: a trait's implementers are the
@@ -32,8 +32,55 @@ pub abstract class CustomValue
   end
 end
 
+# A nested SQL array inside a `DBValue`: where its elements are in a `DBArrays`.
+#
+# An array element cannot hold a growing array itself (SPEC 2.2), so a value
+# holds this fixed pair and all elements of all depths sit in one flat list.
+pub struct DBArray
+  getter start : Int32
+  getter size : Int32
+
+  def initialize(@start : Int32, @size : Int32)
+  end
+end
+
 # A value a driver can bind as an argument or answer from `ResultSet#read`.
-pub alias DBValue = Nil | Bool | Char | String | Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float32 | Float64 | Time | Span | Bytes | CustomValue | Array(DBValue)
+pub alias DBValue = Nil | Bool | Char | String | Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float32 | Float64 | Time | Span | Bytes | CustomValue | DBArray
+
+# The elements of the nested arrays of one argument list or one row. An
+# owner (SPEC 2.1): declare it with a name, in the scope that uses the values,
+# and pass it on.
+pub class DBArrays
+  getter values : Array(DBValue)
+
+  def initialize
+    @values = [] of DBValue
+  end
+
+  # The element at 0-based *index* of *array*.
+  def [](array : DBArray, index : Int32) : DBValue
+    raise "DBArray index out of bounds" unless 0 <= index < array.size
+    @values[array.start + index]
+  end
+
+  # Yields each element of *array*.
+  def each(array : DBArray, & : DBValue -> Nil) : Nil
+    array.size.times { |index| yield @values[array.start + index] }
+  end
+
+  # An array of *size* nils, for a driver to fill with `#[]=`.
+  def allocate(size : Int32) : DBArray
+    start = @values.size
+    size.times { @values << nil }
+    DBArray.new(start, size)
+  end
+
+  def []=(array : DBArray, index : Int32, value : DBValue) : Nil
+    raise "DBArray index out of bounds" unless 0 <= index < array.size
+    @values[array.start + index] = value
+    nil
+  end
+end
 
 # The types every driver is expected to read and bind. `DB::TYPES` and
 # `DB::Any` in crystal-db.
@@ -48,54 +95,76 @@ pub struct ExecResult
   end
 end
 
-# *arg* as a `DBValue`: an array element by element, so `[1, nil]` binds as
-# one array argument. A type that is not a database value is refused at
-# compile time, by the cast.
-#
-# One generic function rather than an overload per kind: a call compiles a
-# non-generic method for the argument's own type, which this module's
-# artifact does not carry (iyi 0.17.0).
-pub def to_db_value(arg : T) : DBValue forall T
+# Writes *arg* as a `DBValue` to `into[at]`: an array element by element, so
+# `[[1, nil]]` binds as one array argument. A type that is not a database
+# value is refused at compile time, by the cast.
+pub def put_db_value(arg : T, into : Array(DBValue), at : Int32, arrays : DBArrays) : Nil forall T
   case arg
   when Array
-    values = [] of DBValue
-    arg.each { |element| values << to_db_value(element) }
-    values
+    array = arrays.allocate(arg.size)
+    index = 0
+    while index < arg.size
+      put_db_value(arg[index], arrays.values, array.start + index, arrays)
+      index += 1
+    end
+    into[at] = array
   else
-    arg.as(DBValue)
+    into[at] = arg.as(DBValue)
   end
+  nil
 end
 
-# The positional arguments of a call followed by its `args:` array, as the
-# one list a driver binds. crystal-db's `EnumerableConcat`. An argument that
-# is not a database value is refused here, at compile time.
-pub def collect_args(args_ : Tuple, args : Array(T)?) : Array(DBValue) forall T
-  all = [] of DBValue
-  args_.each { |arg| all << to_db_value(arg) }
+# Appends the positional arguments of a call and then its `args:` array to
+# *into*, the one list a driver binds; nested arrays go to *arrays*.
+# crystal-db's `EnumerableConcat`. An argument that is not a database value
+# is refused here, at compile time.
+pub def collect_args(args_ : Tuple, args : Array(T)?, into : Array(DBValue), arrays : DBArrays) : Nil forall T
+  args_.each do |arg|
+    into << nil
+    put_db_value(arg, into, into.size - 1, arrays)
+  end
   if extra = args
-    extra.each { |arg| all << to_db_value(arg) }
+    extra.each do |arg|
+      into << nil
+      put_db_value(arg, into, into.size - 1, arrays)
+    end
   end
-  all
+  nil
 end
 
-# How *value* is written into the "Executing query" log line: `"a"`, `1`,
+# Writes how *value* appears in the "Executing query" log line: `"a"`, `1`,
 # `nil`, `[1, 2]`, and a `CustomValue`'s `to_log`.
-pub def log_value(value : DBValue) : String
+pub def log_value(value : DBValue, arrays : DBArrays, writer : String::Builder) : Nil
   case value
-  when Array
-    "[" + value.map { |element| log_value(element) }.join(", ") + "]"
+  when DBArray
+    writer << "["
+    index = 0
+    arrays.each(value) do |element|
+      writer << ", " if index > 0
+      index += 1
+      log_value(element, arrays, writer)
+    end
+    writer << "]"
   when CustomValue
-    value.to_log
+    writer << value.to_log
   when Time
-    value.to_s
+    writer << value.to_s
   when Span
-    value.to_s
+    writer << value.to_s
   else
-    value.inspect
+    writer << value.inspect
   end
+  nil
 end
 
 # The log rendering of a bound argument list: `["a", 1, nil]`.
-pub def args_to_log(args : Array(DBValue)) : String
-  "[" + args.map { |arg| log_value(arg) }.join(", ") + "]"
+pub def args_to_log(args : Array(DBValue), arrays : DBArrays) : String
+  writer = String::Builder.new(64)
+  writer << "["
+  args.each_with_index do |arg, index|
+    writer << ", " if index > 0
+    log_value(arg, arrays, writer)
+  end
+  writer << "]"
+  writer.finish
 end

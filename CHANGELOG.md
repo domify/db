@@ -1,5 +1,21 @@
 # Unreleased
 
+## v0.2.0
+
+Port to ris 0.1.0 memory rules. Each block and task owns one connection.
+Connections, statements, result sets and transactions use block scopes. Read
+text inside its block; typed result forms return flat values.
+
+Errors are flat structs with at most 240 message bytes. DBFailure is the plain
+error. Driver#new_connection and Connection#build_statement construct without
+IO; Connection#open and Statement#prepare do the work. Driver specs use
+SpecSyntax. Mapping readers and column_names have block forms for text.
+Mapping errors retain context in their flat message.
+
+Remove pools, checkout/release, automatic retries, statement caching, connection
+builders, statement hooks and nested error causes. Port the tests and load
+program; remove the pool concurrency program. Update README and CI for ris.
+
 The memory driver contract specs also verify raw SQL and savepoint state with prepared statements
 enabled and disabled.
 

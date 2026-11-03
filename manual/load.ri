@@ -1,68 +1,67 @@
-# crystal-db's spec/manual/load_test.cr. To be executed as:
-#
-# % iyi run manual/load.iyi
-#
-# It generates a number of producers and consumers. If the process hangs
-# it means that the connection pool is not working properly. Likely a race condition.
-#
+# Run with: ris run manual/load.ri
 module manual/load
 
 import std/text
 import db/db
-import db/errors::{DBError}
 import db/testing/dummy_driver::*
 
-CONNECTION = "dummy://host?initial_pool_size=5&max_pool_size=5&max_idle_pool_size=5"
+CONNECTION = "dummy://host"
 
-alias TChannel = Channel(Int32)
-alias TDone = Channel(Bool)
+struct Completed
+  getter index : Int32
+
+  def initialize(@index : Int32)
+  end
+end
+
+struct Finished
+end
 
 COUNT = 200
 
-def start_consumer(channel : TChannel, done : TDone)
+def start_consumer
   indeces = Set(Int32).new
   while true
-    received = channel.receive
-    break unless received.is_a?(Int32)
-    indeces.add received
+    received = RisBoard.take(Completed)
+    raise "consumer cancelled" if received.is_a?(Cancelled)
+    indeces.add received.index
     puts "Received size=#{indeces.size}"
     break if indeces.size == COUNT
   end
-  done.send true
+  RisBoard.post(Finished.new)
 end
 
-# crystal's block-form `DB.open` returned while the producers still ran;
-# here the producers' group keeps the database open until they are done.
-def start_producers(channel : TChannel)
-  ::Db::Db.open CONNECTION do |db|
-    sql = "1,title,description,2023 " * 100_000
-
-    group do |g|
-      COUNT.times do |index|
-        g.spawn do
-          puts "Sending #{index}"
-          films = db.query_all(sql, as: Tuple(Int32, String, String, Int32))
-          if films.is_a?(DBError)
-            puts "Error: #{films.message}"
-          end
-          channel.send index
-          0
-        end
+def start_producers
+  group do |g|
+    COUNT.times do |index|
+      g.spawn do
+        ::Db::Db.open(CONNECTION) do |db|
+          sql = "1,title,description,2023 " * 100_000
+          rows = 0
+          db.query_each(sql) do |rs|
+            assert rs.read(Int32).or_panic == 1
+            assert rs.read(String).or_panic == "title"
+            assert rs.read(String).or_panic == "description"
+            assert rs.read(Int32).or_panic == 2023
+            rows += 1
+          end.or_panic
+          assert rows == 100_000
+        end.or_panic
+        RisBoard.post(Completed.new(index))
+        0
       end
     end
-  end.or_panic
+  end
 end
 
-channel = TChannel.new
-done = TDone.new
 group do |g|
-  # crystal's `start_consumer` spawned the consumer itself; an iyi task
+  # crystal's `start_consumer` spawned the consumer itself; a ris task
   # belongs to a group, so it is spawned here.
   g.spawn do
-    start_consumer(channel, done)
+    start_consumer
     0
   end
-  start_producers(channel)
+  start_producers
 
-  done.receive
+  RisBoard.take(Finished)
 end

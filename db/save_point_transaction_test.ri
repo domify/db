@@ -1,173 +1,94 @@
-# crystal-db's spec/save_point_transaction_spec.cr.
 module db/save_point_transaction_test
 
-import db/db
 import db/errors::*
 import db/core::*
 import db/spec::{describe, it, expect_error}
 import db/testing/dummy_driver::*
 
-def with_dummy_top_transaction(& : DummyTransaction, DummyConnection -> Nil) : Nil
+def with_dummy_top_transaction(& : Transaction, DummyConnection -> Nil) : Nil
   with_dummy_connection do |cnn|
-    cnn.transaction do |tx|
-      yield tx.as(DummyTransaction), cnn
-    end.or_panic
+    cnn.transaction { |tx| yield tx, cnn }.or_panic
+    assert cnn.commits == 1
+    assert cnn.rollbacks == 0
   end
 end
 
-def with_dummy_nested_transaction(& : DummySavePointTransaction, DummyConnection -> Nil) : Nil
+def with_dummy_nested_transaction(& : Transaction, DummyConnection -> Nil) : Nil
   with_dummy_connection do |cnn|
+    released = 0
     cnn.transaction do |tx|
       tx.transaction do |nested|
-        yield nested.as(DummySavePointTransaction), cnn
+        yield nested, cnn
+        released = cnn.releases
       end.or_panic
+      assert cnn.releases == released + 1
     end.or_panic
+    assert cnn.commits == 1
+    assert cnn.rollbacks == 0
   end
 end
 
 describe "SavePointTransaction" do
   {% for context in [:with_dummy_top_transaction, :with_dummy_nested_transaction] %}
-  describe "{{context.id}}" do
-    it "begin/commit transaction from parent transaction" do
-      {{context.id}} do |parent_tx|
-        tx = parent_tx.begin_transaction.or_panic
-        tx.commit.or_panic
-      end
-    end
+    describe "{{context.id}}" do
+      {% for method in [:commit, :rollback] %}
+        it "begin/{{method.id}} transaction from parent transaction" do
+          {{context.id}} do |parent, cnn|
+            releases = cnn.releases
+            rollbacks = cnn.savepoint_rollbacks
+            parent.transaction do |tx|
+              assert tx.is_a?(SavePointTransaction)
+              assert tx.connection == cnn
+              tx.{{method.id}}.or_panic
+            end.or_panic
+            assert cnn.releases == releases + ({{method == :commit}} ? 1 : 0)
+            assert cnn.savepoint_rollbacks == rollbacks + ({{method == :rollback}} ? 1 : 0)
+          end
+        end
+      {% end %}
 
-    it "begin/rollback transaction from parent transaction" do
-      {{context.id}} do |parent_tx|
-        tx = parent_tx.begin_transaction.or_panic
-        tx.rollback.or_panic
-      end
-    end
-
-    it "raise if begin over existing transaction" do
-      {{context.id}} do |parent_tx|
-        parent_tx.begin_transaction.or_panic
-        expect_error(parent_tx.begin_transaction, DBError, "There is an existing nested transaction in this transaction")
-        nil
-      end
-    end
-
-    it "allow sequential transactions" do
-      {{context.id}} do |parent_tx|
-        tx = parent_tx.begin_transaction.or_panic
-        tx.rollback.or_panic
-
-        tx = parent_tx.begin_transaction.or_panic
-        tx.commit.or_panic
-      end
-    end
-
-    it "transaction with block from parent transaction should be committed" do
-      t : DummySavePointTransaction? = nil
-
-      with_witness do |w|
-        {{context.id}} do |parent_tx|
-          parent_tx.transaction do |tx|
-            if tx.is_a?(DummySavePointTransaction)
-              t = tx
-              w.check
-            end
+      it "raise if begin over existing transaction" do
+        {{context.id}} do |parent, cnn|
+          parent.transaction do |tx|
+            expect_error(parent.transaction { |_| }, DBError, "There is an existing nested transaction in this transaction")
+            nil
           end.or_panic
         end
       end
 
-      tx = t || raise "no transaction"
-      assert tx.committed
-      assert !tx.rolledback
+      it "allow sequential transactions" do
+        {{context.id}} do |parent, cnn|
+          releases = cnn.releases
+          rollbacks = cnn.savepoint_rollbacks
+          parent.transaction { |tx| tx.rollback }.or_panic
+          parent.transaction { |tx| tx.commit }.or_panic
+          assert cnn.releases == releases + 1
+          assert cnn.savepoint_rollbacks == rollbacks + 1
+        end
+      end
+
+      it "transaction with block from parent transaction should be committed" do
+        {{context.id}} do |parent, cnn|
+          releases = cnn.releases
+          seen = false
+          parent.transaction do |tx|
+            seen = true
+            assert tx.is_a?(SavePointTransaction)
+          end.or_panic
+          assert seen
+          assert cnn.releases == releases + 1
+        end
+      end
+
+      it "only nested transaction should roll back on Rollback" do
+        {{context.id}} do |parent, cnn|
+          rollbacks = cnn.savepoint_rollbacks
+          assert parent.transaction { |_| Rollback.new }.nil?
+          assert cnn.savepoint_rollbacks == rollbacks + 1
+          assert cnn.rollbacks == 0
+          assert !parent.closed?
+        end
+      end
     end
-  end
   {% end %}
-
-  # the nested blocks answer Rollback instead of raising it
-  it "only nested transaction with block from parent transaction should be rolledback if raise DB::Rollback" do
-    top : DummyTransaction? = nil
-    t : DummySavePointTransaction? = nil
-
-    with_witness do |w|
-      with_dummy_top_transaction do |parent_tx|
-        top = parent_tx
-        res = parent_tx.transaction do |tx|
-          if tx.is_a?(DummySavePointTransaction)
-            t = tx
-            w.check
-          end
-          Rollback.new
-        end
-        assert res.nil?
-      end
-    end
-
-    tx = t || raise "no transaction"
-    assert tx.rolledback
-    assert !tx.committed
-
-    top_tx = top || raise "no top transaction"
-    assert !top_tx.rolledback
-    assert top_tx.committed
-  end
-
-  it "only nested transaction with block from parent nested transaction should be rolledback if raise DB::Rollback" do
-    top : DummySavePointTransaction? = nil
-    t : DummySavePointTransaction? = nil
-
-    with_witness do |w|
-      with_dummy_nested_transaction do |parent_tx|
-        top = parent_tx
-        res = parent_tx.transaction do |tx|
-          if tx.is_a?(DummySavePointTransaction)
-            t = tx
-            w.check
-          end
-          Rollback.new
-        end
-        assert res.nil?
-      end
-    end
-
-    tx = t || raise "no transaction"
-    assert tx.rolledback
-    assert !tx.committed
-
-    top_tx = top || raise "no top transaction"
-    assert !top_tx.rolledback
-    assert top_tx.committed
-  end
-
-  it "releasing result_set from within inner transaction should not return connection to pool" do
-    the_cnn : Connection? = nil
-    with_dummy do |db|
-      db.transaction do |tx|
-        tx.transaction do |inner|
-          cnn = inner.connection
-          the_cnn = cnn
-          cnn.scalar("1").or_panic
-          assert !db.pool.is_available?(cnn)
-        end.or_panic
-        assert !db.pool.is_available?(the_cnn || raise "no connection")
-      end.or_panic
-      assert db.pool.is_available?(the_cnn || raise "no connection")
-    end
-  end
-
-  it "releasing result_set from within inner inner transaction should not return connection to pool" do
-    the_cnn : Connection? = nil
-    with_dummy do |db|
-      db.transaction do |tx|
-        tx.transaction do |inner|
-          inner.transaction do |inner_inner|
-            cnn = inner_inner.connection
-            the_cnn = cnn
-            cnn.scalar("1").or_panic
-            assert !db.pool.is_available?(cnn)
-          end.or_panic
-          assert !db.pool.is_available?(the_cnn || raise "no connection")
-        end.or_panic
-        assert !db.pool.is_available?(the_cnn || raise "no connection")
-      end.or_panic
-      assert db.pool.is_available?(the_cnn || raise "no connection")
-    end
-  end
 end

@@ -1,7 +1,7 @@
 # crystal-db's spec/custom_drivers_types_spec.cr.
 module db/custom_drivers_types_test
 
-import std/uri::{URI, Params}
+import std/uri::{ParsedURI, URI, Params}
 import std/text
 import std/slice::{Slice, Bytes}
 import std/time::{Time}
@@ -13,7 +13,7 @@ import db/spec::{describe, it, expect_error}
 import db/testing/dummy_driver::{with_witness}
 
 # A driver's own value type is a `CustomValue` subclass (crystal: any class).
-class FooValue < CustomValue
+pub class FooValue < CustomValue
   def initialize(@value : Int32)
   end
 
@@ -25,37 +25,32 @@ end
 alias FooAny = Any | FooValue
 
 class FooDriver < Driver
-  class FooConnectionBuilder < ConnectionBuilder
-    def initialize(@options : Connection::Options)
-    end
-
-    def build : Connection | DBError
-      FooConnection.new(@options)
-    end
-  end
 
   @@row = [] of FooAny
 
   def self.fake_row=(row : Array(FooAny))
-    @@row = row
+    @@row.clear
+    row.each do |value|
+      case value
+      when String then @@row << value.copy_to(Program.tape)
+      when FooValue then @@row << value.copy_to(Program.tape)
+      when Nil, Bool, Int32, Int64, Float32, Float64 then @@row << value
+      else raise "unsupported custom fixture value"
+      end
+    end
   end
 
   def self.fake_row : Array(FooAny)
     @@row
   end
 
-  def connection_builder(uri : URI) : ConnectionBuilder | DBError
-    params = Params.parse(uri.query || "")
-    FooConnectionBuilder.new(connection_options(params)!)
+  def new_connection(uri : URI | ParsedURI, options : Connection::Options) : Connection
+    FooConnection.new(options)
   end
 
   class FooConnection < Connection
-    def build_prepared_statement(query : String) : Statement | DBError
+    def build_statement(query : String, prepared : Bool) : Statement
       FooStatement.new(self, query)
-    end
-
-    def build_unprepared_statement(query : String) : Statement | DBError
-      DBError.new("not implemented")
     end
 
     def transaction_state : TransactionState
@@ -68,12 +63,16 @@ class FooDriver < Driver
   end
 
   class FooStatement < Statement
-    protected def perform_query(args : Array(DBValue)) : ResultSet | DBError
+    protected def perform_query(args : Array(DBValue), arrays : DBArrays) : Nil | DBError
       args.each { |arg| process_arg(arg)! }
+      nil
+    end
+
+    protected def new_result_set : ResultSet
       FooResultSet.new(self, FooDriver.fake_row)
     end
 
-    protected def perform_exec(args : Array(DBValue)) : ExecResult | DBError
+    protected def perform_exec(args : Array(DBValue), arrays : DBArrays) : ExecResult | DBError
       args.each { |arg| process_arg(arg)! }
       ExecResult.new 0i64, 0i64
     end
@@ -84,7 +83,7 @@ class FooDriver < Driver
     # else answers the error.
     private def process_arg(value : DBValue) : Nil | DBError
       return nil if value.is_a?(Any) || value.is_a?(FooValue)
-      DBError.new("#{self.class} does not support #{value.class} params")
+      DBFailure.new("#{self.class} does not support #{value.class} params")
     end
   end
 
@@ -110,6 +109,16 @@ class FooDriver < Driver
       @row[@index - 1]
     end
 
+    def read(t : String.class) : String | DBError
+      @index += 1
+      @row[@index - 1].as(String)
+    end
+
+    def read(t : (String | Nil).class) : String | Nil | DBError
+      @index += 1
+      @row[@index - 1].as(String | Nil)
+    end
+
     def next_column_index : Int32
       @index
     end
@@ -122,7 +131,7 @@ end
 
 ::Db::Db.register_driver "foo", FooDriver
 
-class BarValue < CustomValue
+pub class BarValue < CustomValue
   getter value : Int32
 
   def initialize(@value : Int32)
@@ -132,37 +141,32 @@ end
 alias BarAny = Any | BarValue
 
 class BarDriver < Driver
-  class BarConnectionBuilder < ConnectionBuilder
-    def initialize(@options : Connection::Options)
-    end
-
-    def build : Connection | DBError
-      BarConnection.new(@options)
-    end
-  end
 
   @@row = [] of BarAny
 
   def self.fake_row=(row : Array(BarAny))
-    @@row = row
+    @@row.clear
+    row.each do |value|
+      case value
+      when String then @@row << value.copy_to(Program.tape)
+      when BarValue then @@row << value.copy_to(Program.tape)
+      when Nil, Bool, Int32, Int64, Float32, Float64 then @@row << value
+      else raise "unsupported custom fixture value"
+      end
+    end
   end
 
   def self.fake_row : Array(BarAny)
     @@row
   end
 
-  def connection_builder(uri : URI) : ConnectionBuilder | DBError
-    params = Params.parse(uri.query || "")
-    BarConnectionBuilder.new(connection_options(params)!)
+  def new_connection(uri : URI | ParsedURI, options : Connection::Options) : Connection
+    BarConnection.new(options)
   end
 
   class BarConnection < Connection
-    def build_prepared_statement(query : String) : Statement | DBError
+    def build_statement(query : String, prepared : Bool) : Statement
       BarStatement.new(self, query)
-    end
-
-    def build_unprepared_statement(query : String) : Statement | DBError
-      DBError.new("not implemented")
     end
 
     def transaction_state : TransactionState
@@ -175,12 +179,16 @@ class BarDriver < Driver
   end
 
   class BarStatement < Statement
-    protected def perform_query(args : Array(DBValue)) : ResultSet | DBError
+    protected def perform_query(args : Array(DBValue), arrays : DBArrays) : Nil | DBError
       args.each { |arg| process_arg(arg)! }
+      nil
+    end
+
+    protected def new_result_set : ResultSet
       BarResultSet.new(self, BarDriver.fake_row)
     end
 
-    protected def perform_exec(args : Array(DBValue)) : ExecResult | DBError
+    protected def perform_exec(args : Array(DBValue), arrays : DBArrays) : ExecResult | DBError
       args.each { |arg| process_arg(arg)! }
       ExecResult.new 0i64, 0i64
     end
@@ -188,7 +196,7 @@ class BarDriver < Driver
     # See FooStatement#process_arg.
     private def process_arg(value : DBValue) : Nil | DBError
       return nil if value.is_a?(Any) || value.is_a?(BarValue)
-      DBError.new("#{self.class} does not support #{value.class} params")
+      DBFailure.new("#{self.class} does not support #{value.class} params")
     end
   end
 
@@ -214,6 +222,16 @@ class BarDriver < Driver
       @row[@index - 1]
     end
 
+    def read(t : String.class) : String | DBError
+      @index += 1
+      @row[@index - 1].as(String)
+    end
+
+    def read(t : (String | Nil).class) : String | Nil | DBError
+      @index += 1
+      @row[@index - 1].as(String | Nil)
+    end
+
     def next_column_index : Int32
       @index
     end
@@ -228,8 +246,8 @@ end
 
 describe "Db" do
   it "should be able to register multiple drivers" do
-    assert ::Db::Db.open("foo://host").or_panic.checkout.or_panic.is_a?(FooDriver::FooConnection)
-    assert ::Db::Db.open("bar://host").or_panic.checkout.or_panic.is_a?(BarDriver::BarConnection)
+    ::Db::Db.open("foo://host") { |cnn| assert cnn.is_a?(FooDriver::FooConnection) }.or_panic
+    ::Db::Db.open("bar://host") { |cnn| assert cnn.is_a?(BarDriver::BarConnection) }.or_panic
   end
 
   it "Foo and Bar drivers should return fake_row" do
@@ -263,11 +281,11 @@ describe "Db" do
   it "drivers should return custom values as scalar" do
     ::Db::Db.open("foo://host") do |db|
       FooDriver.fake_row = [FooValue.new(3)] of FooAny
-      assert db.scalar("query").or_panic.as(FooValue).value == 3
+      db.scalar("query") { |value| assert value.as(FooValue).value == 3 }.or_panic
     end.or_panic
   end
 
-  # class names are fully qualified in iyi: the stable parts are matched
+  # class names are fully qualified in ris: the stable parts are matched
   it "Foo and Bar drivers should not implement each other read" do
     with_witness do |w|
       ::Db::Db.open("foo://host") do |db|
@@ -308,12 +326,12 @@ describe "Db" do
       db.query("query", 1, "string", FooValue.new(5)) { }.or_panic
       db.query("query", args: [1, "string", FooValue.new(5)] of DBValue) { }.or_panic
 
-      db.query("query").or_panic.close
-      db.query("query", 1).or_panic.close
-      db.query("query", 1, "string").or_panic.close
-      db.query("query", Bytes.new(4)).or_panic.close
-      db.query("query", 1, "string", FooValue.new(5)).or_panic.close
-      db.query("query", args: [1, "string", FooValue.new(5)] of DBValue).or_panic.close
+      db.query("query") { }.or_panic
+      db.query("query", 1) { }.or_panic
+      db.query("query", 1, "string") { }.or_panic
+      db.query("query", Bytes.new(4)) { }.or_panic
+      db.query("query", 1, "string", FooValue.new(5)) { }.or_panic
+      db.query("query", args: [1, "string", FooValue.new(5)] of DBValue) { }.or_panic
     end.or_panic
 
     ::Db::Db.open("bar://host") do |db|
@@ -325,12 +343,12 @@ describe "Db" do
       db.query("query", 1, "string", BarValue.new(5)) { }.or_panic
       db.query("query", args: [1, "string", BarValue.new(5)] of DBValue) { }.or_panic
 
-      db.query("query").or_panic.close
-      db.query("query", 1).or_panic.close
-      db.query("query", 1, "string").or_panic.close
-      db.query("query", Bytes.new(4)).or_panic.close
-      db.query("query", 1, "string", BarValue.new(5)).or_panic.close
-      db.query("query", args: [1, "string", BarValue.new(5)] of DBValue).or_panic.close
+      db.query("query") { }.or_panic
+      db.query("query", 1) { }.or_panic
+      db.query("query", 1, "string") { }.or_panic
+      db.query("query", Bytes.new(4)) { }.or_panic
+      db.query("query", 1, "string", BarValue.new(5)) { }.or_panic
+      db.query("query", args: [1, "string", BarValue.new(5)] of DBValue) { }.or_panic
     end.or_panic
   end
 

@@ -9,116 +9,63 @@ import db/query_params::{fetch_bool}
 import db/spec::{describe, it, expect_error}
 import db/testing/dummy_driver::*
 
-def connections : Array(DummyConnection)
-  DummyConnection.connections
-end
-
 describe "Db" do
+  it "keeps error messages flat and bounded" do
+    error = DBFailure.new("x" * 300)
+    assert error.message.bytesize == 240
+    assert error.message == "x" * 240
+  end
+
   it "should get driver class by name" do
-    # a metaclass's `==` is not the class's identity in iyi's prelude
     assert ::Db::Db.driver_class("dummy").or_panic.to_s == DummyDriver.to_s
   end
 
-  it "should create dummy connection" do
-    db = ::Db::Db.open("dummy://localhost:1027").or_panic
-    assert db.checkout.or_panic.is_a?(DummyConnection)
-  end
-
-  it "should create a connection and close it" do
-    DummyConnection.clear_connections
-    ::Db::Db.open("dummy://localhost") do |db|
-    end.or_panic
-    assert connections.size == 1
-    assert connections.first.closed?
-  end
-
-  it "should create a connection and close it" do
-    DummyConnection.clear_connections
-    ::Db::Db.connect("dummy://localhost") do |cnn|
-      assert cnn.is_a?(DummyConnection)
-    end.or_panic
-    assert connections.size == 1
-    assert connections.first.closed?
-  end
-
-  it "should create a connection and wait for explicit closing" do
-    DummyConnection.clear_connections
-    cnn = ::Db::Db.connect("dummy://localhost").or_panic
-    assert cnn.is_a?(DummyConnection)
-    assert connections.size == 1
-    assert !connections.first.closed?
-    cnn.close
-    assert connections.first.closed?
-  end
-
-  it "query should close result_set" do
-    with_witness do |w|
-      with_dummy do |db|
-        db.query("1,2") do
-          break
-        end
-
-        w.check
-        assert DummyResultSet.last_result_set.closed?
-      end
-    end
-  end
-
-  it "scalar should close statement" do
-    with_dummy do |db|
-      db.scalar("1").or_panic
-      assert DummyResultSet.last_result_set.closed?
-    end
-  end
-
-  it "initially a single connection should be created" do
-    with_dummy do |db|
-      assert connections.size == 1
-    end
-  end
-
-  it "the connection should be closed after db usage" do
-    with_dummy do |db|
-      assert !connections.first.closed?
-    end
-    assert connections.first.closed?
-  end
-
-  it "should answer PoolTimeout if the sole connection is been used" do
-    with_dummy "dummy://host?max_pool_size=1&checkout_timeout=0.5" do |db|
-      db.query("1") do |rs|
-        expect_error(db.scalar("2"), PoolTimeout)
-        nil
+  {% for method in [:open, :connect] %}
+    it "{{method.id}} creates one connection and closes it" do
+      opened = DummyConnection.connections_count
+      closed = DummyConnection.closed_count
+      ::Db::Db.{{method.id}}("dummy://localhost") do |cnn|
+        assert cnn.is_a?(DummyConnection)
+        assert !cnn.closed?
+        assert DummyConnection.connections_count == opened + 1
+        assert DummyConnection.closed_count == closed
       end.or_panic
+      assert DummyConnection.closed_count == closed + 1
     end
-  end
+  {% end %}
 
-  it "should use 'unlimited' connections by default" do
-    with_dummy "dummy://host?checkout_timeout=0.5" do |db|
-      rs = [] of ResultSet
-      500.times do
-        rs << db.query("1").or_panic
-      end
-      assert DummyConnection.connections.size == 500
-    end
-  end
-
-  it "exec should return to pool" do
+  it "query should close result_set on break" do
     with_dummy do |db|
+      closed = DummyResultSet.closed_count
+      db.query("1,2") { |rs| break }
+      assert DummyResultSet.closed_count == closed + 1
+    end
+  end
+
+  it "scalar should close statement and result set" do
+    with_dummy do |db|
+      statements = DummyStatement.closed_count
+      results = DummyResultSet.closed_count
+      assert db.scalar("1", as: Int64).or_panic == 1
+      assert DummyStatement.closed_count == statements + 1
+      assert DummyResultSet.closed_count == results + 1
+    end
+  end
+
+  it "sequential calls use the same open connection" do
+    with_dummy do |db|
+      count = DummyConnection.connections_count
       db.exec("foo").or_panic
       db.exec("bar").or_panic
-    end
-  end
-
-  it "scalar should return to pool" do
-    with_dummy do |db|
-      db.scalar("foo").or_panic
-      db.scalar("bar").or_panic
+      db.scalar("foo") { |v| assert v == "foo" }.or_panic
+      db.scalar("bar") { |v| assert v == "bar" }.or_panic
+      assert DummyConnection.connections_count == count
+      assert !db.closed?
     end
   end
 
   it "gives nice error message when no driver is registered for schema (#21)" do
-    expect_error(::Db::Db.open("foobar://baz"), ArgumentError, %(no driver was registered for the schema "foobar", did you maybe forget to require the database driver?))
+    expect_error(::Db::Db.open("foobar://baz") { |_| }, ArgumentError, %(no driver was registered for the schema "foobar", did you maybe forget to require the database driver?))
   end
 
   it "should parse boolean query string params" do

@@ -14,64 +14,169 @@
 # tables, published on COMMIT; savepoints are snapshots of that copy.
 module db/driver_specs_test
 
-import std/uri::{URI, Params}
+import std/uri::{ParsedURI, URI, Params}
 import std/text
 import std/indexable
 import db/db
 import db/errors::*
 import db/value::*
 import db/core::*
-import db/spec::{DriverSpecs}
+import db/spec::{SpecSyntax, DriverSpecs}
 
-class MemoryTable
-  getter columns : Array(String)
-  getter sql_types : Array(String)
-  getter rows : Array(Array(DBValue))
+import std/slice
 
-  def initialize(@columns : Array(String), @sql_types : Array(String), @rows : Array(Array(DBValue)))
+alias MemoryValue = Nil | Bool | String | Int32 | Int64 | Float32 | Float64
+
+CELLS = SlicePool(MemoryValue).new
+NAMES = SlicePool(String).new
+ROWS = SlicePool(MemoryRow).new
+SNAPSHOTS = SlicePool(TableEntry).new
+
+def stored_names(values : Array(String)) : SlicePool::Run(String)
+  run = NAMES.alloc_slice(values.size)
+  values.each_with_index { |value, i| run[i] = value.copy_to(Program.tape) }
+  run
+end
+
+def stored_rows(values : Array(MemoryRow)) : SlicePool::Run(MemoryRow)
+  run = ROWS.alloc_slice(values.size)
+  values.each_with_index { |value, i| run[i] = value }
+  run
+end
+
+@[OnTape]
+struct MemoryRow
+  getter values : SlicePool::Run(MemoryValue)
+
+  def initialize
+    @values = CELLS.alloc_slice(0)
+  end
+
+  def initialize(values : Array(DBValue))
+    @values = CELLS.alloc_slice(values.size)
+    values.each_with_index do |value, i|
+      @values[i] = case value
+      when String then value.copy_to(Program.tape)
+      when Nil, Bool, Int32, Int64, Float32, Float64 then value
+      else raise "unsupported memory fixture value"
+      end
+    end
+  end
+
+  def [](index : Int32) : DBValue
+    @values[index]
+  end
+
+  def size : Int32
+    @values.size
+  end
+end
+
+@[OnTape]
+struct MemoryTable
+  getter columns : SlicePool::Run(String)
+  getter sql_types : SlicePool::Run(String)
+  @row_count : Int32
+
+  def rows : SlicePool::Run(MemoryRow)
+    @rows[0, @row_count]
+  end
+
+  def initialize(columns : Array(String), sql_types : Array(String), rows : Array(MemoryRow))
+    @columns = stored_names(columns)
+    @sql_types = stored_names(sql_types)
+    @rows = ROWS.alloc_slice(1024)
+    @row_count = rows.size
+    rows.each_with_index { |row, i| @rows[i] = row }
+  end
+
+  def initialize(@columns : SlicePool::Run(String), @sql_types : SlicePool::Run(String), @rows : SlicePool::Run(MemoryRow), @row_count : Int32)
+  end
+
+  def column_index(name : String) : Int32?
+    @columns.each_with_index { |value, i| return i if value == name }
+    nil
+  end
+
+  def add_row(row : MemoryRow) : Nil
+    raise "memory fixture row limit" if @row_count >= @rows.size
+    @rows[@row_count] = row.copy_to(Program.tape)
+    @row_count += 1
   end
 
   def copy : MemoryTable
-    rows = [] of Array(DBValue)
-    @rows.each { |row| rows << row.dup }
-    MemoryTable.new(@columns.dup, @sql_types.dup, rows)
+    copied = ROWS.alloc_slice(1024)
+    rows.each_with_index { |row, i| copied[i] = row }
+    MemoryTable.new(@columns, @sql_types, copied, @row_count)
   end
 end
 
-# The committed tables of every database, by the URI's host.
+@[OnTape]
+struct TableEntry
+  getter name : String
+  getter table : MemoryTable?
+
+  def initialize(@name : String = "", @table : MemoryTable? = nil)
+  end
+end
+
+@[OnTape]
+struct MemorySavepoint
+  getter name : String
+  getter tables : SlicePool::Run(TableEntry)
+
+  def initialize(@name : String, tables : Hash(String, MemoryTable))
+    @tables = SNAPSHOTS.alloc_slice(tables.size)
+    i = 0
+    tables.each do |name, table|
+      @tables[i] = TableEntry.new(name, table.copy)
+      i += 1
+    end
+  end
+end
+
 class MemoryStore
-  @@databases = {} of String => Hash(String, MemoryTable)
+  @@tables = {} of String => MemoryTable
+  @@working = {} of String => MemoryTable
+  @@savepoints = [] of MemorySavepoint
 
   def self.tables(name : String) : Hash(String, MemoryTable)
-    if tables = @@databases[name]?
-      return tables
-    end
-    tables = {} of String => MemoryTable
-    @@databases[name] = tables
-    tables
+    @@tables
+  end
+
+  def self.working : Hash(String, MemoryTable)
+    @@working
+  end
+
+  def self.savepoints : Array(MemorySavepoint)
+    @@savepoints
   end
 
   def self.publish(name : String, tables : Hash(String, MemoryTable)) : Nil
-    @@databases[name] = tables
+    copy_into(tables, @@tables)
   end
 
   def self.reset : Nil
-    @@databases = {} of String => Hash(String, MemoryTable)
+    @@tables.clear
+    @@working.clear
+    @@savepoints.clear
   end
 
-  def self.copy(tables : Hash(String, MemoryTable)) : Hash(String, MemoryTable)
-    result = {} of String => MemoryTable
-    tables.each { |name, table| result[name] = table.copy }
-    result
+  def self.copy_into(tables : Hash(String, MemoryTable), into : Hash(String, MemoryTable)) : Nil
+    into.clear
+    tables.each { |name, table| into[name] = table.copy.copy_to(Program.tape) }
   end
 end
 
-class MemoryResult
-  getter names : Array(String)
-  getter rows : Array(Array(DBValue))
+@[OnTape]
+struct MemoryResult
+  getter names : SlicePool::Run(String)
+  getter rows : SlicePool::Run(MemoryRow)
   getter rows_affected : Int64
 
-  def initialize(@names : Array(String), @rows : Array(Array(DBValue)), @rows_affected : Int64 = 0_i64)
+  def initialize(names : Array(String), rows : Array(MemoryRow), @rows_affected : Int64 = 0_i64)
+    @names = stored_names(names)
+    @rows = stored_rows(rows)
   end
 end
 
@@ -83,7 +188,7 @@ class Binder
   end
 
   def next_arg : DBValue | DBError
-    return DBError.new("missing argument #{@index + 1}") if @index >= @args.size
+    return DBFailure.new("missing argument #{@index + 1}") if @index >= @args.size
     value = @args[@index]
     @index += 1
     value
@@ -91,40 +196,25 @@ class Binder
 end
 
 class MemoryDriver < Driver
-  def connection_builder(uri : URI) : ConnectionBuilder | DBError
-    params = Params.parse(uri.query || "")
-    MemoryConnectionBuilder.new(connection_options(params)!, uri.host || "default")
-  end
-end
-
-class MemoryConnectionBuilder < ConnectionBuilder
-  def initialize(@options : Connection::Options, @database : String)
-  end
-
-  def build : Connection | DBError
-    MemoryConnection.new(@options, @database)
+  def new_connection(uri : URI | ParsedURI, options : Connection::Options) : Connection
+    MemoryConnection.new(options, uri.host || "default")
   end
 end
 
 class MemoryConnection < Connection
-  @working : Hash(String, MemoryTable)? = nil
-  @savepoints : Array(Tuple(String, Hash(String, MemoryTable)))
+  @in_transaction = false
 
   def initialize(options : Connection::Options, @database : String)
     super(options)
-    @savepoints = [] of Tuple(String, Hash(String, MemoryTable))
+
   end
 
-  def build_prepared_statement(query : String) : Statement | DBError
-    MemoryStatement.new(self, query, true)
-  end
-
-  def build_unprepared_statement(query : String) : Statement | DBError
-    MemoryStatement.new(self, query, false)
+  def build_statement(query : String, prepared : Bool) : Statement
+    MemoryStatement.new(self, query, prepared)
   end
 
   def transaction_state : TransactionState
-    @working.nil? ? TransactionState::Idle : TransactionState::InTransaction
+    @in_transaction ? TransactionState::InTransaction : TransactionState::Idle
   end
 
   def driver_name : String
@@ -133,7 +223,7 @@ class MemoryConnection < Connection
 
   # The tables this connection sees: its transaction's copy, if any.
   def tables : Hash(String, MemoryTable)
-    @working || MemoryStore.tables(@database)
+    @in_transaction ? MemoryStore.working : MemoryStore.tables(@database)
   end
 
   def execute(sql : String, args : Array(DBValue)) : MemoryResult | DBError
@@ -142,52 +232,58 @@ class MemoryConnection < Connection
     binder = Binder.new(args)
 
     if lower == "begin"
-      return DBError.new("transaction already begun") if @working
-      @working = MemoryStore.copy(MemoryStore.tables(@database))
-      @savepoints.clear
-      return MemoryResult.new([] of String, [] of Array(DBValue))
+      return DBFailure.new("transaction already begun") if @in_transaction
+      MemoryStore.copy_into(MemoryStore.tables(@database), MemoryStore.working)
+      @in_transaction = true
+      MemoryStore.savepoints.clear
+      return MemoryResult.new([] of String, [] of MemoryRow).copy_to(Program.tape)
     end
     if lower == "commit"
-      working = @working || return DBError.new("no transaction to commit")
+      return DBFailure.new("no transaction to commit") unless @in_transaction
+      working = MemoryStore.working
       MemoryStore.publish(@database, working)
-      @working = nil
-      @savepoints.clear
-      return MemoryResult.new([] of String, [] of Array(DBValue))
+      @in_transaction = false
+      MemoryStore.savepoints.clear
+      return MemoryResult.new([] of String, [] of MemoryRow).copy_to(Program.tape)
     end
     if lower == "rollback"
-      return DBError.new("no transaction to roll back") unless @working
-      @working = nil
-      @savepoints.clear
-      return MemoryResult.new([] of String, [] of Array(DBValue))
+      return DBFailure.new("no transaction to roll back") unless @in_transaction
+      @in_transaction = false
+      MemoryStore.savepoints.clear
+      return MemoryResult.new([] of String, [] of MemoryRow).copy_to(Program.tape)
     end
     if lower.starts_with?("savepoint ")
-      working = @working || return DBError.new("savepoint outside a transaction")
-      @savepoints << {sql[10, sql.size - 10].strip, MemoryStore.copy(working)}
-      return MemoryResult.new([] of String, [] of Array(DBValue))
+      return DBFailure.new("savepoint outside a transaction") unless @in_transaction
+      working = MemoryStore.working
+      MemoryStore.savepoints << MemorySavepoint.new(sql[10, sql.size - 10].strip, working).copy_to(Program.tape)
+      return MemoryResult.new([] of String, [] of MemoryRow).copy_to(Program.tape)
     end
     if lower.starts_with?("release savepoint ")
       name = sql[18, sql.size - 18].strip
-      index = savepoint_index(name) || return DBError.new("no such savepoint: #{name}")
-      while @savepoints.size > index
-        @savepoints.pop
+      index = savepoint_index(name) || return DBFailure.new("no such savepoint: #{name}")
+      while MemoryStore.savepoints.size > index
+        MemoryStore.savepoints.pop
       end
-      return MemoryResult.new([] of String, [] of Array(DBValue))
+      return MemoryResult.new([] of String, [] of MemoryRow).copy_to(Program.tape)
     end
     if lower.starts_with?("rollback to ")
       name = sql[12, sql.size - 12].strip
-      index = savepoint_index(name) || return DBError.new("no such savepoint: #{name}")
-      @working = MemoryStore.copy(@savepoints[index][1])
-      while @savepoints.size > index
-        @savepoints.pop
+      index = savepoint_index(name) || return DBFailure.new("no such savepoint: #{name}")
+      MemoryStore.working.clear
+      MemoryStore.savepoints[index].tables.each do |entry|
+        MemoryStore.working[entry.name] = (entry.table || raise "missing snapshot table").copy.copy_to(Program.tape)
       end
-      return MemoryResult.new([] of String, [] of Array(DBValue))
+      while MemoryStore.savepoints.size > index
+        MemoryStore.savepoints.pop
+      end
+      return MemoryResult.new([] of String, [] of MemoryRow).copy_to(Program.tape)
     end
     if lower.starts_with?("create table ")
       return create_table(sql)
     end
     if lower.starts_with?("drop table if exists ")
       tables.delete(sql[21, sql.size - 21].strip)
-      return MemoryResult.new([] of String, [] of Array(DBValue))
+      return MemoryResult.new([] of String, [] of MemoryRow).copy_to(Program.tape)
     end
     if lower.starts_with?("insert into ")
       return insert(sql, binder)
@@ -198,20 +294,20 @@ class MemoryConnection < Connection
       end
       return select_scalar(sql[7, sql.size - 7].strip, binder)
     end
-    DBError.new("unsupported statement: #{sql}")
+    DBFailure.new("unsupported statement: #{sql}")
   end
 
   private def savepoint_index(name : String) : Int32?
-    @savepoints.each_with_index do |savepoint, index|
-      return index if savepoint[0] == name
+    MemoryStore.savepoints.each_with_index do |savepoint, index|
+      return index if savepoint.name == name
     end
     nil
   end
 
   private def create_table(sql : String) : MemoryResult | DBError
-    open = sql.index('(') || return DBError.new("syntax error: #{sql}")
+    open = sql.index('(') || return DBFailure.new("syntax error: #{sql}")
     name = sql[13, open - 13].strip
-    return DBError.new("table #{name} already exists") if tables[name]?
+    return DBFailure.new("table #{name} already exists") if tables[name]?
     columns = [] of String
     sql_types = [] of String
     split_list(inside_parens(sql, open)).each do |definition|
@@ -219,50 +315,51 @@ class MemoryConnection < Connection
       columns << words[0]
       sql_types << words[1]
     end
-    tables[name] = MemoryTable.new(columns, sql_types, [] of Array(DBValue))
-    MemoryResult.new([] of String, [] of Array(DBValue))
+    tables[name.copy_to(Program.tape)] = MemoryTable.new(columns, sql_types, [] of MemoryRow).copy_to(Program.tape)
+    MemoryResult.new([] of String, [] of MemoryRow).copy_to(Program.tape)
   end
 
   private def insert(sql : String, binder : Binder) : MemoryResult | DBError
-    open = sql.index('(') || return DBError.new("syntax error: #{sql}")
+    open = sql.index('(') || return DBFailure.new("syntax error: #{sql}")
     name = sql[12, open - 12].strip
-    table = tables[name]? || return DBError.new("no such table: #{name}")
+    table = (tables[name]? || return DBFailure.new("no such table: #{name}")).copy_to(Program.tape)
     columns = split_list(inside_parens(sql, open))
-    values_at = sql.downcase.index(" values ") || return DBError.new("syntax error: #{sql}")
-    values_open = sql.index('(', values_at) || return DBError.new("syntax error: #{sql}")
+    values_at = sql.downcase.index(" values ") || return DBFailure.new("syntax error: #{sql}")
+    values_open = sql.index('(', values_at) || return DBFailure.new("syntax error: #{sql}")
     expressions = split_list(inside_parens(sql, values_open))
-    return DBError.new("#{columns.size} columns but #{expressions.size} values") if columns.size != expressions.size
+    return DBFailure.new("#{columns.size} columns but #{expressions.size} values") if columns.size != expressions.size
 
     row = [] of DBValue
     table.columns.each { row << nil }
     columns.each_with_index do |column, index|
-      position = table.columns.index(column) || return DBError.new("no such column: #{column}")
+      position = table.column_index(column) || return DBFailure.new("no such column: #{column}")
       value = evaluate(expressions[index], binder)!
-      row[position] = coerce(value, table.sql_types[position])
+      row[position] = persist(coerce(value, table.sql_types[position])).copy_to(Program.tape)
     end
-    table.rows << row
-    MemoryResult.new([] of String, [] of Array(DBValue), 1_i64)
+    table.add_row(MemoryRow.new(row))
+    tables[name] = table
+    MemoryResult.new([] of String, [] of MemoryRow, 1_i64).copy_to(Program.tape)
   end
 
   private def select_from(list : String, name : String) : MemoryResult | DBError
-    table = tables[name]? || return DBError.new("no such table: #{name}")
+    table = (tables[name]? || return DBFailure.new("no such table: #{name}")).copy_to(Program.tape)
     if list.downcase == "count(*)"
-      row = [] of DBValue
-      row << table.rows.size.to_i64
-      return MemoryResult.new(["count(*)"], [row])
+      count_row = [] of DBValue
+      count_row << table.rows.size.to_i64
+      return MemoryResult.new(["count(*)"], [MemoryRow.new(count_row)]).copy_to(Program.tape)
     end
-    names = list == "*" ? table.columns.dup : split_list(list)
+    names = list == "*" ? table.columns.map { |name| name } : split_list(list)
     positions = [] of Int32
     names.each do |column|
-      positions << (table.columns.index(column) || return DBError.new("no such column: #{column}"))
+      positions << (table.column_index(column) || return DBFailure.new("no such column: #{column}"))
     end
-    rows = [] of Array(DBValue)
+    rows = [] of MemoryRow
     table.rows.each do |stored|
       row = [] of DBValue
       positions.each { |position| row << stored[position] }
-      rows << row
+      rows << MemoryRow.new(row).copy_to(Program.tape)
     end
-    MemoryResult.new(names, rows)
+    MemoryResult.new(names, rows).copy_to(Program.tape)
   end
 
   # `e` or `e as type`.
@@ -276,7 +373,7 @@ class MemoryConnection < Connection
     value = evaluate(expression, binder)!
     row = [] of DBValue
     row << coerce(value, sql_type)
-    MemoryResult.new(["c0"], [row])
+    MemoryResult.new(["c0"], [MemoryRow.new(row)]).copy_to(Program.tape)
   end
 
   private def evaluate(expression : String, binder : Binder) : DBValue | DBError
@@ -293,7 +390,15 @@ class MemoryConnection < Connection
     if float = expression.to_f?
       return float
     end
-    DBError.new("invalid expression: #{expression}")
+    DBFailure.new("invalid expression: #{expression}")
+  end
+
+  private def persist(value : DBValue) : MemoryValue
+    case value
+    when String then value.copy_to(Program.tape)
+    when Nil, Bool, Int32, Int64, Float32, Float64 then value
+    else raise "unsupported memory fixture value"
+    end
   end
 
   # Integer columns hold `Int64`s.
@@ -336,22 +441,24 @@ class MemoryConnection < Connection
   # *text* split at the commas outside quotes, each part stripped.
   private def split_list(text : String) : Array(String)
     parts = [] of String
-    current = ""
     quoted = false
-    text.each_char do |char|
-      if char == '\''
+    start = 0
+    index = 0
+    while index < text.bytesize
+      byte = text.byte_at(index)
+      if byte == 39_u8
         quoted = !quoted
-        current += char.to_s
-      elsif char == ',' && !quoted
-        parts << current.strip
-        current = ""
-      else
-        current += char.to_s
+      elsif byte == 44_u8 && !quoted
+        parts << text[start, index - start].strip
+        start = index + 1
       end
+      index += 1
     end
-    parts << current.strip unless current.strip.empty?
+    last = text[start, text.bytesize - start].strip
+    parts << last unless last.empty?
     parts
   end
+
 end
 
 class MemoryStatement < Statement
@@ -365,12 +472,18 @@ class MemoryStatement < Statement
     @prepared
   end
 
-  protected def perform_query(args : Array(DBValue)) : ResultSet | DBError
-    result = @connection.as(MemoryConnection).execute(command, args)!
-    MemoryResultSet.new(self, result)
+  @result : MemoryResult? = nil
+
+  protected def perform_query(args : Array(DBValue), arrays : DBArrays) : Nil | DBError
+    @result = @connection.as(MemoryConnection).execute(command, args)!
+    nil
   end
 
-  protected def perform_exec(args : Array(DBValue)) : ExecResult | DBError
+  protected def new_result_set : ResultSet
+    MemoryResultSet.new(self, @result || raise "query not started")
+  end
+
+  protected def perform_exec(args : Array(DBValue), arrays : DBArrays) : ExecResult | DBError
     result = @connection.as(MemoryConnection).execute(command, args)!
     ExecResult.new(result.rows_affected, 0_i64)
   end
@@ -399,9 +512,9 @@ class MemoryResultSet < ResultSet
   end
 
   def read : DBValue | DBError
-    return DBError.new("no row to read") unless 0 <= @row_index && @row_index < @result.rows.size
+    return DBFailure.new("no row to read") unless 0 <= @row_index && @row_index < @result.rows.size
     row = @result.rows[@row_index]
-    return DBError.new("no column #{@column_index} to read") if @column_index >= row.size
+    return DBFailure.new("no column #{@column_index} to read") if @column_index >= row.size
     value = row[@column_index]
     @column_index += 1
     value
@@ -409,6 +522,23 @@ class MemoryResultSet < ResultSet
 
   def next_column_index : Int32
     @column_index
+  end
+
+  def read(t : String.class) : String | DBError
+    index = @column_index
+    @column_index += 1
+    value = @result.rows[@row_index][index]
+    value.is_a?(String) ? value : mismatch(index, value, "String")
+  end
+
+  def read(t : (String | Nil).class) : String | Nil | DBError
+    index = @column_index
+    @column_index += 1
+    value = @result.rows[@row_index][index]
+    case value
+    when String, Nil then value
+    else mismatch(index, value, "(String | Nil)")
+    end
   end
 
   # An `Int32` is read from the stored `Int64`.
@@ -425,7 +555,7 @@ class MemoryResultSet < ResultSet
     end
   end
 
-  # `(Int32 | Nil).class`, not `Int32?.class`: iyi 0.17.0 writes the short
+  # `(Int32 | Nil).class`, not `Int32?.class`: ris 0.1.0 writes the short
   # spelling into an artifact as `Int32 | ::Nil.class`.
   def read(t : (Int32 | Nil).class) : Int32? | DBError
     index = next_column_index
@@ -458,7 +588,54 @@ end
 # The `prepared_statements` value of every run of the `:both` example below.
 PREPARED_RUNS = [] of Bool
 
-DriverSpecs.run do |specs|
+class MemorySyntax < SpecSyntax
+  def binding(index : Int32) : String
+    "?"
+  end
+
+  def select_scalar(expression : String, sql_type : String?) : String
+    if t = sql_type
+      "select #{expression} as #{t}"
+    else
+      "select #{expression}"
+    end
+  end
+
+  def create_table_1column(table_name : String, col1 : DriverSpecs::ColumnDef) : String
+    "create table #{table_name} (#{col1.name} #{col1.sql_type} #{col1.null ? "null" : "not null"})"
+  end
+
+  def create_table_2columns(table_name : String, col1 : DriverSpecs::ColumnDef, col2 : DriverSpecs::ColumnDef) : String
+    "create table #{table_name} (#{col1.name} #{col1.sql_type} #{col1.null ? "null" : "not null"}, #{col2.name} #{col2.sql_type} #{col2.null ? "null" : "not null"})"
+  end
+
+  def insert_1column(table_name : String, col1 : DriverSpecs::ColumnDef, expr1 : String) : String
+    "insert into #{table_name} (#{col1.name}) values (#{expr1})"
+  end
+
+  def insert_2columns(table_name : String, col1 : DriverSpecs::ColumnDef, expr1 : String, col2 : DriverSpecs::ColumnDef, expr2 : String) : String
+    "insert into #{table_name} (#{col1.name}, #{col2.name}) values (#{expr1}, #{expr2})"
+  end
+
+  def select_1column(table_name : String, col1 : DriverSpecs::ColumnDef) : String
+    "select #{col1.name} from #{table_name}"
+  end
+
+  def select_2columns(table_name : String, col1 : DriverSpecs::ColumnDef, col2 : DriverSpecs::ColumnDef) : String
+    "select #{col1.name}, #{col2.name} from #{table_name}"
+  end
+
+  def select_count(table_name : String) : String
+    "select count(*) from #{table_name}"
+  end
+
+  def drop_table_if_exists(table_name : String) : String
+    "drop table if exists #{table_name}"
+  end
+end
+
+syntax = MemorySyntax.new
+DriverSpecs.run(syntax) do |specs|
   specs.connection_string "memory://specs"
 
   specs.before do
@@ -470,61 +647,18 @@ DriverSpecs.run do |specs|
   end
 
   specs.encode_null "NULL"
+
   specs.sample_value "hello", "text", "'hello'"
   specs.sample_value 1, "int", "1"
   specs.sample_value 1_234_567_890_123_i64, "bigint", "1234567890123"
   specs.sample_value 1.5, "double", "1.5"
   specs.sample_value true, "bool", "true"
 
-  specs.binding_syntax do |index|
-    "?"
-  end
-
-  specs.select_scalar_syntax do |expression, sql_type|
-    if t = sql_type
-      "select #{expression} as #{t}"
-    else
-      "select #{expression}"
-    end
-  end
-
-  specs.create_table_1column_syntax do |table_name, col1|
-    "create table #{table_name} (#{col1.name} #{col1.sql_type} #{col1.null ? "null" : "not null"})"
-  end
-
-  specs.create_table_2columns_syntax do |table_name, col1, col2|
-    "create table #{table_name} (#{col1.name} #{col1.sql_type} #{col1.null ? "null" : "not null"}, #{col2.name} #{col2.sql_type} #{col2.null ? "null" : "not null"})"
-  end
-
-  specs.insert_1column_syntax do |table_name, col1, expr1|
-    "insert into #{table_name} (#{col1.name}) values (#{expr1})"
-  end
-
-  specs.insert_2columns_syntax do |table_name, col1, expr1, col2, expr2|
-    "insert into #{table_name} (#{col1.name}, #{col2.name}) values (#{expr1}, #{expr2})"
-  end
-
-  specs.select_1column_syntax do |table_name, col1|
-    "select #{col1.name} from #{table_name}"
-  end
-
-  specs.select_2columns_syntax do |table_name, col1, col2|
-    "select #{col1.name}, #{col2.name} from #{table_name}"
-  end
-
-  specs.select_count_syntax do |table_name|
-    "select count(*) from #{table_name}"
-  end
-
-  specs.drop_table_if_exists_syntax do |table_name|
-    "drop table if exists #{table_name}"
-  end
-
   specs.it "runs a custom example against the memory driver" do |db|
-    assert db.scalar("select 42 as int").or_panic == 42_i64
+    db.scalar("select 42 as int") { |value| assert value == 42_i64 }.or_panic
     db.exec("create table table1 (col1 int not null)").or_panic
     assert db.exec("insert into table1 (col1) values (?)", 7).or_panic.rows_affected == 1
-    assert db.query_one("select col1 from table1", as: Int32).or_panic == 7
+    db.query_one("select col1 from table1") { |rs| assert rs.read(Int32).or_panic == 7 }.or_panic
   end
 
   specs.it "reports raw transaction state independently of managed transactions", prepared: :both do |db|
@@ -551,10 +685,12 @@ DriverSpecs.run do |specs|
       tx.transaction do |nested|
         nested.connection.exec("insert into table1 (col1) values (2)").or_panic
       end.or_panic
-      assert tx.connection.scalar("select count(*) from table1").or_panic == 2_i64
-      assert db.scalar("select count(*) from table1").or_panic == 0_i64
+      tx.connection.scalar("select count(*) from table1") { |value| assert value == 2_i64 }.or_panic
+      ::Db::Db.open("memory://specs") do |other|
+        other.scalar("select count(*) from table1") { |value| assert value == 0_i64 }.or_panic
+      end.or_panic
     end.or_panic
-    assert db.scalar("select count(*) from table1").or_panic == 2_i64
+    db.scalar("select count(*) from table1") { |value| assert value == 2_i64 }.or_panic
   end
 
   # The `:both` runs open the database with each `prepared_statements` value

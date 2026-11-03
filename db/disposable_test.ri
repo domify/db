@@ -12,7 +12,7 @@ class ADisposable
   property fail = false
 
   protected def do_close : Nil | DBError
-    return DBError.new("Unable to close") if @fail
+    return DBFailure.new("Unable to close") if @fail
     nil
   end
 end
@@ -32,7 +32,7 @@ describe "Disposable" do
     obj = ADisposable.new
     obj.fail = true
     assert !obj.closed?
-    # crystal raised from do_close; iyi's close answers the error
+    # crystal raised from do_close; ris's close answers the error
     expect_error(obj.close, DBError, "Unable to close")
     assert !obj.closed?
   end

@@ -10,7 +10,7 @@ import db/serializable::{mapping}
 import db/spec::{describe, it, expect_error}
 import db/testing/dummy_driver::*
 
-# crystal's `String#to_slice`, which iyi's prelude has not.
+# crystal's `String#to_slice`, which ris's prelude has not.
 def bytes_of(text : String) : Bytes
   Bytes.new(text.bytesize) { |i| text.byte_at(i) }
 end
@@ -64,16 +64,19 @@ class MappingWithKeys
   })
 end
 
+CONVERTER_BYTES = Bytes.new(1024)
+
 class MappingWithConverter
   module Base64Converter
     def self.from_rs(rs : ResultSet) : Bytes | DBError
-      text = rs.read(String)
-      return text if text.is_a?(DBError)
-      bytes_of(Base64.decode(text))
+      decoded = Base64.decode(rs.read(String)!)
+      raise "converter fixture too long" if decoded.bytesize > CONVERTER_BYTES.size
+      decoded.bytesize.times { |i| CONVERTER_BYTES[i] = decoded.byte_at(i) }
+      CONVERTER_BYTES[0, decoded.bytesize]
     end
   end
 
-  # crystal's `Slice(UInt8)`: iyi's `Bytes` alias names the std slice type
+  # crystal's `Slice(UInt8)`: ris's `Bytes` alias names the std slice type
   mapping({
     c0: {type: Bytes, converter: MappingWithConverter::Base64Converter},
     c1: {type: String},
@@ -82,22 +85,31 @@ end
 
 # crystal's `Type.new(rs)` raising becomes `from_db_row` answering the error.
 macro from_dummy(query, type)
-  %obj : {{ type }} | DBError | Nil = nil
+  %error : DBError = DBFailure.new("expected a mapping error")
   with_dummy do |db|
-    rs = db.query({{ query }}).or_panic
-    rs.move_next.or_panic
-    %obj = {{ type }}.from_db_row(rs)
-    rs.close
+    db.query({{ query }}) do |rs|
+      rs.move_next.or_panic
+      %value = {{ type }}.from_db_row(rs) { |_| raise "expected a mapping error" }
+      assert %value.is_a?(DBError)
+      %error = %value.as(DBError)
+      nil
+    end.or_panic
   end
-  %obj.as({{ type }} | DBError)
+  %error
 end
 
 macro expect_mapping(query, t, values)
-  %obj = from_dummy({{ query }}, {{ t }}).or_panic
-  assert %obj.is_a?({{ t }})
-  {% for key, value in values %}
-    assert %obj.{{ key.id }} == {{ value }}
-  {% end %}
+  with_dummy do |db|
+    db.query({{ query }}) do |rs|
+      rs.move_next.or_panic
+      {{ t }}.from_db_row(rs) do |obj|
+        assert obj.is_a?({{ t }})
+        {% for key, value in values %}
+          assert obj.{{ key.id }} == {{ value }}
+        {% end %}
+      end.or_panic
+    end.or_panic
+  end
 end
 
 describe "mapping" do
@@ -160,49 +172,45 @@ describe "mapping" do
     expect_mapping("Zm9v,a", MappingWithConverter, {c0: bytes_of("foo"), c1: "a"})
   end
 
-  it "should initialize multiple instances from a single resultset" do
-    with_dummy do |db|
-      db.query("1,a 2,b") do |rs|
-        objs = SimpleMapping.from_rs(rs).or_panic
-        assert objs.size == 2
-        assert objs[0].c0 == 1
-        assert objs[0].c1 == "a"
-        assert objs[1].c0 == 2
-        assert objs[1].c1 == "b"
-      end.or_panic
+  {% for close_check in [false, true] %}
+    it "from_rs reads multiple objects and closes result set ({{close_check}})" do
+      with_dummy do |db|
+        db.query("1,a 2,b") do |rs|
+          count = 0
+          SimpleMapping.from_rs(rs) do |obj|
+            assert obj.c0 == count + 1
+            assert obj.c1 == (count == 0 ? "a" : "b")
+            count += 1
+          end.or_panic
+          assert count == 2
+          assert rs.closed?
+        end.or_panic
+      end
     end
-  end
-
-  it "Class.from_rs should close resultset" do
-    with_dummy do |db|
-      rs = db.query("1,a 2,b").or_panic
-      objs = SimpleMapping.from_rs(rs).or_panic
-      assert rs.closed?
-
-      assert objs.size == 2
-      assert objs[0].c0 == 1
-      assert objs[0].c1 == "a"
-      assert objs[1].c0 == 2
-      assert objs[1].c1 == "b"
-    end
-  end
+  {% end %}
 
   it "should initialize from a query_one" do
     with_dummy do |db|
-      obj = db.query_one("1,a", as: SimpleMapping).or_panic
-      assert obj.c0 == 1
-      assert obj.c1 == "a"
+      db.query_one("1,a") do |rs|
+        SimpleMapping.from_db_row(rs) do |obj|
+          assert obj.c0 == 1
+          assert obj.c1 == "a"
+        end.or_panic
+      end.or_panic
     end
   end
 
   it "should initialize from a query_all" do
     with_dummy do |db|
-      objs = db.query_all("1,a 2,b", as: SimpleMapping).or_panic
-      assert objs.size == 2
-      assert objs[0].c0 == 1
-      assert objs[0].c1 == "a"
-      assert objs[1].c0 == 2
-      assert objs[1].c1 == "b"
+      count = 0
+      db.query_each("1,a 2,b") do |rs|
+        SimpleMapping.from_db_row(rs) do |obj|
+          assert obj.c0 == count + 1
+          assert obj.c1 == (count == 0 ? "a" : "b")
+          count += 1
+        end.or_panic
+      end.or_panic
+      assert count == 2
     end
   end
 end

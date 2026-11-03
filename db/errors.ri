@@ -1,106 +1,79 @@
-# Every way a database call can fail, as values (SPEC.md III.1).
+# The errors of database calls.
 #
-# crystal-db raises `DB::Error` and its subclasses. iyi has no exceptions:
-# a fallible call answers `T | DBError`, `!` hands the error to the caller,
-# and an exhaustive `case` tells the kinds apart. The hierarchy is the one
-# crystal-db has, so `in PoolTimeout` still means what `rescue DB::PoolTimeout`
-# meant, and `in DBError` still catches all of them. A driver adds its own
-# kinds by subclassing `DBError`.
+# `DBError` is a flat struct: its message sits in the struct, cut off at
+# `MESSAGE_SIZE` bytes, and nothing of it is on a tape. So `!` carries it out of
+# any def or block, and it needs no copy to outlive the scope that made it
+# (SPEC 1.1). A driver's own error is a struct under it, as `SQLite3Error` is.
 module db/errors
 
-# The root of every error this library and its drivers answer. Crystal's
-# `DB::Error`.
-pub class DBError
-  getter message : String
-  # The error this one was raised over, when it wraps another.
-  getter cause : DBError?
+import std/static_array
 
-  def initialize(@message : String = "", @cause : DBError? = nil)
+pub abstract struct DBError
+  MESSAGE_SIZE = 240
+
+  @message_bytes : StaticArray(UInt8, 240)
+  @message_size : Int32
+
+  def initialize(message : String = "")
+    @message_bytes = StaticArray(UInt8, 240).new(0_u8)
+    @message_size = message.bytesize < MESSAGE_SIZE ? message.bytesize : MESSAGE_SIZE
+    index = 0
+    while index < @message_size
+      @message_bytes[index] = message.byte_at(index)
+      index += 1
+    end
+  end
+
+  # The message, on the caller's tape.
+  def message : String
+    String.build(@message_size) { |writer| @message_size.times { |index| writer.push(@message_bytes[index]) } }
   end
 
   def to_s : String
-    @message
+    message
   end
 
   def inspect : String
-    "#<#{self.class}: #{@message}>"
+    "#<#{self.class}: #{message}>"
   end
 end
 
 impl Error for DBError
-  def message : String
-    @message
-  end
 end
 
-# A value that could not be read into an object: a missing or unknown
-# column, or a column whose value the property's type cannot hold. Crystal's
-# `DB::MappingException`.
-pub class MappingError < DBError
-  getter klass : String
-  getter property : String?
-
-  def initialize(message : String, @klass : String, @property : String? = nil, cause : DBError? = nil)
-    text = message + "\n  deserializing " + @klass
-    if prop = @property
-      text = text + "#" + prop
-    end
-    super(text, cause)
-  end
+# A failure with nothing more to say than its message.
+pub struct DBFailure < DBError
 end
 
-# No resource could be checked out of the pool within `checkout_timeout`.
-pub class PoolTimeout < DBError
+# A row could not be read into a type.
+pub struct MappingError < DBError
 end
 
-# Every attempt `Pool#retry` was allowed to make lost its resource.
-pub class PoolRetryAttemptsExceeded < DBError
+# The connection could not be opened.
+pub struct ConnectionRefused < DBError
 end
 
-# A resource of the pool stopped working. Building the error closes the
-# resource, as crystal-db's does, so the pool never hands it out again.
-pub class PoolResourceLost(T) < DBError
-  getter resource : T
-
-  def initialize(@resource : T, cause : DBError? = nil)
-    super("", cause)
-    @resource.close
-  end
+# The connection went away while it was in use.
+pub struct ConnectionLost < DBError
 end
 
-# A new resource could not be created. `Pool#retry` tries again.
-pub class PoolResourceRefused < DBError
+# Answered from a `transaction` block, rolls it back and answers nil.
+pub struct Rollback < DBError
 end
 
-# A connection could not be established, probably for network or
-# configuration reasons. The pool's retry logic tries again.
-pub class ConnectionRefused < PoolResourceRefused
+# A query that had to answer a row did not.
+pub struct NoResultsError < DBError
 end
 
-# The value a `transaction` block answers to have the transaction rolled
-# back without answering an error: the block's error-free counterpart of
-# crystal-db's `raise DB::Rollback.new`.
-pub class Rollback < DBError
-end
-
-# A `scalar` or `query_one` found no row.
-pub class NoResultsError < DBError
-end
-
-# A column held a value of another type than the one asked for.
-pub class ColumnTypeMismatchError < DBError
+# A column does not hold the type it was read as.
+pub struct ColumnTypeMismatchError < DBError
   getter column_index : Int32
-  getter column_name : String
-  getter column_type : String
-  getter expected_type : String
 
-  def initialize(*, context : String, @column_index : Int32, @column_name : String, @column_type : String, @expected_type : String)
+  def initialize(*, context : String, @column_index : Int32, column_name : String, column_type : String, expected_type : String)
     super("In #{context} the column #{column_name} returned a #{column_type} but a #{expected_type} was expected.")
   end
 end
 
-# An argument the library cannot use: an unknown driver name, a connection
-# option it cannot parse. Crystal's `ArgumentError`, which iyi's prelude does
-# not have.
-pub class ArgumentError < DBError
+# An argument the call cannot take.
+pub struct ArgumentError < DBError
 end

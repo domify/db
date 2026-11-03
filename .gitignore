@@ -7,3 +7,5 @@
 # Local binaries
 /bin/
 /tmp/
+
+/.ris-cache/

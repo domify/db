@@ -1,92 +1,11 @@
-# The entry point: `Db::Db.open`, `Db::Db.connect` and the driver
-# registry, crystal-db's `DB` module. iyi-db is the common database interface
-# for iyi, ported from crystal-db (https://github.com/crystal-lang/crystal-db);
-# a driver for a specific database is needed to access one.
-#
-# Individual database systems are supported by specific driver modules,
-# which register themselves with `register_driver` when they are imported.
-#
-# A `Database` manages a connection pool. The pool is configured by query
-# parameters of the connection URI, as described in `Database`.
-#
-# ### Usage
-#
-# ```
-# import db/db/db
-#
-# db = Db::Db.open("sqlite3:./path/to/db/file.db")!
-# db.close
-# ```
-#
-# With a block the database is closed when the block is left:
-#
-# ```
-# Db::Db.open("sqlite3:./file.db") do |db|
-#   # work with db
-# end
-# ```
-#
-# `db` is a `Database`; `QueryMethods` describes how to query it. Three kinds
-# of statements can be performed:
-#
-# 1. `Database#exec` expects no rows back.
-# 2. `Database#scalar` reads a single value of the response.
-# 3. `Database#query` returns a `ResultSet` over the rows and columns.
-#
-# All of them take query arguments, positionally or as an `args:` array.
-# iyi-db does not interpret the statements: SQLite writes `?` where
-# PostgreSQL writes `$1`, `$2`, ...
-#
-# ```
-# import db/db/db
-# import db/db/value::{DBValue}
-# import db/db/errors::{DBError}
-# import sqlite3/sqlite3 # a driver
-#
-# def contacts : Nil | DBError
-#   Db::Db.open("sqlite3:./file.db") do |db|
-#     db.exec("create table contacts (name text, age integer)")!
-#     db.exec("insert into contacts values (?, ?)", "John Doe", 30)!
-#
-#     args = [] of DBValue
-#     args << "Sarah"
-#     args << 33
-#     db.exec("insert into contacts values (?, ?)", args: args)!
-#
-#     puts "max age:"
-#     puts db.scalar("select max(age) from contacts")! # => 33
-#
-#     puts "contacts:"
-#     db.query("select name, age from contacts order by age desc") do |rs|
-#       puts "#{rs.column_name(0)} (#{rs.column_name(1)})"
-#       # => name (age)
-#       rs.each do
-#         puts "#{rs.read(String)!} (#{rs.read(Int32)!})"
-#         # => Sarah (33)
-#         # => John Doe (30)
-#       end!
-#     end!
-#   end!
-# end
-# ```
-#
-# ### Object mapping
-#
-# `derive db_serializable` (module `db/serializable`) maps the rows of a
-# result set to a struct or class.
+# One connection per block and task.
 module db/db
 
-# The types live in `db/core`, `db/errors`, `db/value`, `db/pooling` and
-# `db/serializable`; a program imports the ones it names. There is no `db`
-# module above them, which would make this `Db.open`: in iyi 0.17.0 an
-# artifact of a module holds the modules under its path again, so a program
-# built from artifacts would have every type twice (iyilang/iyi#124).
-
-import std/uri::{URI, Params}
+import std/uri::{ParsedURI, URI, Params}
 import db/errors::*
 import db/core::*
 
-pub VERSION = "0.1.1"
+pub VERSION = "0.2.0"
 
 DRIVERS = {} of String => Driver.class
 
@@ -103,7 +22,7 @@ end
 # Generic so the driver's own class never becomes the argument type of this
 # module's compiled code: a call with `PgDriver` would compile a
 # `register_driver(String, PgDriver.class)` that this module's artifact
-# cannot carry (iyi 0.17.0).
+# cannot carry (ris 0.1.0).
 pub def register_driver(driver_name : String, driver_class : D.class) : Nil forall D
   store_driver(driver_name, driver_class.as(Driver.class))
 end
@@ -112,84 +31,35 @@ def store_driver(driver_name : String, driver_class : Driver.class) : Nil
   DRIVERS[driver_name] = driver_class
 end
 
-# Creates a `Database` pool and opens its initial connection(s) as
-# specified in the connection *uri*. Use `connect` to open a single
-# connection.
-#
-# The scheme of the *uri* determines the driver to use. Connection
-# parameters such as hostname, user, database name, etc. are specified
-# according to each database driver's specific format.
-#
-# The returned database must be closed by `Database#close`.
-#
-# (A `String` and a `URI` overload rather than one `URI | String`: a call
-# compiles the method for the argument's own type, and an artifact carries
-# the method as declared, iyi 0.17.0.)
-pub def open(uri : String) : Database | DBError
+# Opens a connection to *uri* for the block and closes it when the block is
+# left. The scheme of the *uri* determines the driver to use; the connection
+# belongs to the task that opened it (SPEC 5.1).
+pub def open(uri : String, & : Connection -> U) : U | DBError forall U
   parsed = parse_uri(uri)!
-  open(parsed)
+  open(parsed) { |connection| yield connection }
 end
 
 # :ditto:
-pub def open(uri : URI) : Database | DBError
-  driver = build_driver(uri)!
-  params = Params.parse(uri.query || "")
-  connection_options = driver.connection_options(params)!
-  pool_options = driver.pool_options(params)!
-  builder = driver.connection_builder(uri)!
-  Database.open(connection_options, pool_options) { builder.build }
-end
-
-# Same as `open`, but the database is yielded and closed when the block is
-# left.
-pub def open(uri : String, & : Database -> U) : U | DBError forall U
-  db = open(uri)!
-  defer db.close
-  yield db
-end
-
-# :ditto:
-pub def open(uri : URI, & : Database -> U) : U | DBError forall U
-  db = open(uri)!
-  defer db.close
-  yield db
-end
-
-# Opens a connection using the specified *uri*. The scheme of the *uri*
-# determines the driver to use. The connection must be closed by
-# `Connection#close`.
-pub def connect(uri : String) : Connection | DBError
-  parsed = parse_uri(uri)!
-  connect(parsed)
-end
-
-# :ditto:
-pub def connect(uri : URI) : Connection | DBError
-  driver = build_driver(uri)!
-  builder = driver.connection_builder(uri)!
-  builder.build
-end
-
-# Same as `connect`, but the connection is yielded and closed when the block
-# is left.
-pub def connect(uri : String, & : Connection -> U) : U | DBError forall U
-  cnn = connect(uri)!
-  defer cnn.close
-  yield cnn
-end
-
-# :ditto:
-pub def connect(uri : URI, & : Connection -> U) : U | DBError forall U
-  cnn = connect(uri)!
-  defer cnn.close
-  yield cnn
-end
-
-def parse_uri(uri : String) : URI | DBError
-  URI.parse?(uri) || ArgumentError.new(%(invalid connection URI "#{uri}"))
-end
-
-def build_driver(uri : URI) : Driver | DBError
+pub def open(uri : URI | ParsedURI, & : Connection -> U) : U | DBError forall U
   klass = driver_class(uri.scheme || "")!
-  klass.new
+  driver = klass.new
+  options = driver.connection_options(Params.parse(uri.query || ""))!
+  connection = driver.new_connection(uri, options)
+  connection.open!
+  defer connection.close
+  yield connection
+end
+
+# The same as `open`, under crystal-db's name for one connection.
+pub def connect(uri : String, & : Connection -> U) : U | DBError forall U
+  open(uri) { |connection| yield connection }
+end
+
+# :ditto:
+pub def connect(uri : URI | ParsedURI, & : Connection -> U) : U | DBError forall U
+  open(uri) { |connection| yield connection }
+end
+
+def parse_uri(uri : String) : ParsedURI | DBError
+  URI.parse?(uri) || ArgumentError.new(%(invalid connection URI "#{uri}"))
 end

@@ -1,0 +1,30 @@
+# Nested SQL arrays as flat `DBValue`s, and their log rendering.
+module db/value_test
+
+import std/tuple
+import db/value::*
+
+def rendered(args_ : Tuple, args : Array(T)?) : String forall T
+  arrays = DBArrays.new
+  bound = [] of DBValue
+  collect_args(args_, args, bound, arrays)
+  args_to_log(bound, arrays)
+end
+
+none = nil.as(Array(Int32)?)
+assert rendered({"a", 1, nil}, none) == %(["a", 1, nil])
+assert rendered({[["a"]]}, none) == %([[["a"]]])
+assert rendered({1, 2}, ["a", "b"]) == %([1, 2, "a", "b"])
+assert rendered({[[1, 2], [] of Int32], [[[3]]]}, none) == "[[[1, 2], []], [[[3]]]]"
+
+arrays = DBArrays.new
+outer = arrays.allocate(2)
+inner = arrays.allocate(1)
+arrays[inner, 0] = 7
+arrays[outer, 0] = inner
+arrays[outer, 1] = "x"
+assert outer.size == 2
+assert arrays[outer, 1] == "x"
+list = [outer] of DBValue
+assert args_to_log(list, arrays) == %([[[7], "x"]])
+puts "value: nested arrays"
