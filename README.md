@@ -82,10 +82,13 @@ Register the driver with `Db::Db.register_driver("name", MyDriver)`.
 
 `Driver#new_connection(uri, options)` builds a connection without IO;
 `Connection#open` opens it. `Connection#build_statement(query, prepared)`
-builds a statement without IO; `Statement#prepare` prepares it. Implement
+builds a statement without IO; `Statement#prepare` prepares it. A connection
+also implements `driver_name` and `transaction_state`, which reports actual
+server state including transactions started by raw SQL. A statement implements
 `perform_query(args, arrays)`, `new_result_set` and `perform_exec(args, arrays)`.
-Implement typed text reads and `transaction_state`, which reports actual
-server state including transactions started by raw SQL.
+A result set implements `move_next`, `column_count`, `column_name(index)`,
+`next_column_index`, `read` and the text reads `read(String)` and
+`read(String?)`.
 
 The shared `DriverSpecs` use a `SpecSyntax` subclass for SQL syntax. See
 `db/driver_specs_test.ri` for an example. `CustomValue` supports driver values.
