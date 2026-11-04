@@ -312,8 +312,8 @@ class MemoryConnection < Connection
     sql_types = [] of String
     split_list(inside_parens(sql, open)).each do |definition|
       words = definition.split(' ')
-      columns << words[0]
-      sql_types << words[1]
+      columns << words[0].copy_to(Program.tape)
+      sql_types << words[1].copy_to(Program.tape)
     end
     tables[name.copy_to(Program.tape)] = MemoryTable.new(columns, sql_types, [] of MemoryRow).copy_to(Program.tape)
     MemoryResult.new([] of String, [] of MemoryRow).copy_to(Program.tape)
