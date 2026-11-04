@@ -1,5 +1,14 @@
 # Unreleased
 
+## v0.3.0
+
+No library API changes since v0.2.0.
+
+The memory driver spec copies column names and types onto the tape, because
+ris rejects strings made inside a loop in arrays that outlive it. The README
+lists every driver contract method. CI builds ris from source and runs on
+pushes to main.
+
 ## v0.2.0
 
 Port to ris 0.1.0 memory rules. Each block and task owns one connection.
