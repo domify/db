@@ -4,24 +4,75 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# git refuses a workspace another user owns; a container job's is one.
+env:
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: safe.directory
+  GIT_CONFIG_VALUE_0: "*"
+  LLVM_CONFIG: llvm-config-23
 
 jobs:
+  # rislang/ris has no release yet, so install_ris.sh has nothing to fetch.
+  # ris is built from a pinned commit the way ris's own CI builds it, and
+  # cached by that commit. macOS waits for a ris release for macOS arm64.
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: crystallang/crystal:1.21.0-build
+      # The compiler's tape checkers recurse past an 8 MB stack.
+      options: --ulimit stack=67108864:67108864
     env:
-      # The oldest ris this release supports (README, Requirements).
-      RIS_VERSION: 0.1.0
+      RIS_REF: ce30d6dfc0f3aee8609cc061e69ab003fd3660c7
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
-      - name: Install ris
+      - name: LLVM 23
         run: |
-          curl -fsSL https://raw.githubusercontent.com/rislang/ris/main/install_ris.sh | RIS_PREFIX="$HOME/.ris" sh
-          echo "$HOME/.ris/bin" >> "$GITHUB_PATH"
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            ca-certificates curl xz-utils zstd > /dev/null
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            > /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" \
+            > /etc/apt/sources.list.d/llvm.list
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends llvm-23-dev > /dev/null
+          llvm-config-23 --version
+
+      - name: Restore ris
+        id: ris-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ris-src
+          key: ris-${{ runner.os }}-${{ env.RIS_REF }}
+
+      - name: Check out ris (cache miss)
+        if: steps.ris-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: rislang/ris
+          ref: ${{ env.RIS_REF }}
+          path: ris-src
+          persist-credentials: false
+
+      - name: Build ris (cache miss)
+        if: steps.ris-cache.outputs.cache-hit != 'true'
+        run: make -C ris-src ris
+
+      - name: Save ris
+        if: steps.ris-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ris-src
+          key: ${{ steps.ris-cache.outputs.cache-primary-key }}
+
+      - run: echo "$GITHUB_WORKSPACE/ris-src/bin" >> "$GITHUB_PATH"
 
       - run: ris version
 
@@ -49,4 +100,3 @@ jobs:
 
       - name: Check formatting
         run: ris fmt --check db manual
-        if: matrix.os == 'ubuntu-24.04'
