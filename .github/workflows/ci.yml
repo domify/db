@@ -6,43 +6,44 @@ on:
   pull_request:
   workflow_dispatch:
 
-# git refuses a workspace another user owns; a container job's is one.
 env:
-  GIT_CONFIG_COUNT: "1"
-  GIT_CONFIG_KEY_0: safe.directory
-  GIT_CONFIG_VALUE_0: "*"
   LLVM_CONFIG: llvm-config-23
 
 jobs:
   # rislang/ris has no release yet, so install_ris.sh has nothing to fetch.
-  # ris is built from a pinned commit the way ris's own CI builds it, and
-  # cached by that commit. macOS waits for a ris release for macOS arm64.
+  # ris is built from a pinned commit, as ris's own CI builds it, and cached
+  # by that commit. macOS waits for a ris release for macOS arm64.
+  #
+  # No job container: driver_specs_test maps about 580k regions and Linux's
+  # default vm.max_map_count is 65530. The limit is the host kernel's, so it
+  # is raised on the runner itself.
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    container:
-      image: crystallang/crystal:1.21.0-build
-      # The compiler's tape checkers recurse past an 8 MB stack.
-      options: --ulimit stack=67108864:67108864
     env:
       RIS_REF: ce30d6dfc0f3aee8609cc061e69ab003fd3660c7
     steps:
+      # The compiler's tape checkers also recurse past an 8 MB stack; each
+      # step that compiles raises its own with ulimit -s.
+      - name: Allow a million memory maps
+        run: sudo sysctl -w vm.max_map_count=1048576
+
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
 
+      - uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: 1.21.0
+
       - name: LLVM 23
         run: |
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends \
-            ca-certificates curl xz-utils zstd > /dev/null
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
-            > /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" \
-            > /etc/apt/sources.list.d/llvm.list
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends llvm-23-dev > /dev/null
+            | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends llvm-23-dev > /dev/null
           llvm-config-23 --version
 
       - name: Restore ris
@@ -50,7 +51,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ris-src
-          key: ris-${{ runner.os }}-${{ env.RIS_REF }}
+          key: ris-host-${{ runner.os }}-${{ env.RIS_REF }}
 
       - name: Check out ris (cache miss)
         if: steps.ris-cache.outputs.cache-hit != 'true'
@@ -63,7 +64,9 @@ jobs:
 
       - name: Build ris (cache miss)
         if: steps.ris-cache.outputs.cache-hit != 'true'
-        run: make -C ris-src ris
+        run: |
+          ulimit -s 65536
+          make -C ris-src ris
 
       - name: Save ris
         if: steps.ris-cache.outputs.cache-hit != 'true'
@@ -77,12 +80,15 @@ jobs:
       - run: ris version
 
       - name: Test
-        run: ris test db
+        run: |
+          ulimit -s 65536
+          ris test db
 
       # Every test again, compiled from the .iyimod artifacts a first build
       # wrote, so the library keeps building module by module (R-1).
       - name: Test from artifacts
         run: |
+          ulimit -s 65536
           for test in db/*_test.ri; do
             mods="$RUNNER_TEMP/mods/$(basename "$test" .ri)"
             mkdir -p "$mods"
@@ -93,6 +99,7 @@ jobs:
 
       - name: Build the manual programs
         run: |
+          ulimit -s 65536
           for program in manual/*.ri; do
             echo "building $program"
             ris build "$program" -o "$RUNNER_TEMP/manual"
