@@ -1,5 +1,12 @@
 # Unreleased
 
+## v0.3.1
+
+The default ResultSet#read_tape is now #read. The old default stored the value
+of #read in a local, which ris refuses for a driver whose #read answers
+tape-backed values, such as pg. A driver that answers Bytes from #read and
+wants text from read_tape overrides it.
+
 ## v0.3.0
 
 No library API changes since v0.2.0.

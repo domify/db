@@ -521,21 +521,12 @@ pub abstract class ResultSet
     read
   end
 
-  # Reads the next column with its text or bytes on the running fiber's
-  # tape as a `String`; any other value as `#read` answers it. This
-  # default copies the heap value `#read` makes; drivers override it to copy
-  # the column's bytes straight onto the tape.
+  # Reads the next column with its text on the running fiber's tape; any
+  # other value as `#read` answers it. This default is `#read`: a driver whose
+  # `#read` answers text in some other way overrides this. Keeping `#read` as
+  # the last call lets a driver's `#read` answer tape-backed values (SPEC 1.9).
   def read_tape : String | DBValue | DBError
-    value = read
-    case value
-    when String then String.new(value)
-    when ::Std::Slice::Bytes
-      writer = String::Builder.new(value.size)
-      value.each { |byte| writer.push(byte) }
-      writer.finish
-    else
-      value
-    end
+    read
   end
 
   # The text of the next column; a type mismatch answers an error. A driver
